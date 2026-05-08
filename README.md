@@ -97,21 +97,6 @@ http://127.0.0.1:8764/
 - 地图瓦片版权归各自提供商（页面内可见 Attribution）。
 - 机场数据若使用 OurAirports，请遵循其数据说明：[OurAirports](https://ourairports.com/data/)。
 
-## 上传到 GitHub 的简要步骤
-
-1. 在 GitHub 上 **新建一个空仓库**（不要初始化 README，或拉取后再推送）。
-2. 在本项目目录配置远程并推送，例如：
-
-```bash
-cd /path/to/地图
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-git branch -M main
-git add .
-git commit -m "添加 README 与项目文件"
-git push -u origin main
-```
-
-若已存在 `origin`，可用 `git remote set-url origin <新地址>` 修改。
 
 **建议**：不要将 `nav_llm.env`、本地缓存或超大私有数据推送到公开仓库；可在 `.gitignore` 中排除 `nav_llm.env`、`__pycache__/`、`*.pyc` 等。
 
