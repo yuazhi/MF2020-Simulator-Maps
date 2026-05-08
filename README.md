@@ -1,6 +1,7 @@
 # MSFS 实时航线图 · SimConnect
 
 在浏览器里用地图查看 **微软模拟飞行（MSFS）** 的飞机实时位置、航迹、计划航路，并带 **PFD / ND 综合显示**。数据通过本机 **SimConnect** 经 Python 桥接服务以 HTTP + SSE 推送给网页，无需单独安装 WebSocket 库。
+具体详情看[MSFS 实时航线图介绍](https://yuazhi.cn/?article=221)
 
 ## 能做什么
 
