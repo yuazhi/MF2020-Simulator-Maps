@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <script src="device-classes.js"></script>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>MSFS 实时航线图 · SimConnect</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div class="hud" id="hud">
+    <div id="status">正在连接数据流…</div>
+    <div class="planline" id="planinfo"></div>
+    <div class="muted" id="detail"></div>
+  </div>
+
+  <div class="toolbar" id="mainToolbar">
+    <div class="toolbar-layer-row">
+      <label class="toolbar-layer-label" for="baseLayerSelect">底图</label>
+      <select id="baseLayerSelect" class="toolbar-select" title="切换地图底图" aria-label="地图底图"></select>
+    </div>
+    <input type="file" id="plnFile" accept=".pln,.xml,text/xml" />
+    <button type="button" id="btnImport"><span class="btn-text-full">导入 .pln 航线</span><span class="btn-text-short">导入</span></button>
+    <button type="button" id="btnFit"><span class="btn-text-full">适配航线窗口</span><span class="btn-text-short">适配</span></button>
+    <button type="button" id="btnClear"><span class="btn-text-full">清除计划航线</span><span class="btn-text-short">清除</span></button>
+    <button type="button" id="btnFollow"><span class="btn-text-full">跟随飞机</span><span class="btn-text-short">跟随</span></button>
+    <button type="button" class="toolbar-more-btn" id="toolbarMoreBtn" aria-expanded="false" aria-controls="toolbarHintsBlock">说明</button>
+    <div class="toolbar-hints-block" id="toolbarHintsBlock">
+      <div class="hint hint-long" id="toolbarHintLong">支持模拟飞行导出的 AceXML（FSX/MSFS .pln）。地图显示计划航路与航点；按航线飞时可看「下一航点」与距离。</div>
+      <div class="hint" id="pageAccessHint" style="font-size: 11px; opacity: 0.9"></div>
+      <div class="hint" style="font-size: 11px; opacity: 0.9">独立 PFD 演示页（合成视景主飞行显示）：<a href="pfd-full.html" style="color: var(--accent)">pfd-full.html</a></div>
+    </div>
+  </div>
+
+  <div class="cockpit-deck-wrap">
+    <div class="pfd-panel" id="pfdPanel">
+      <div class="pfd-panel-head">
+        <button type="button" class="pfd-collapse-btn" id="pfdCollapseBtn" title="收起 / 展开综合显示" aria-expanded="true" aria-controls="pfdPanelBody">
+          <span class="pfd-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="deck-title">CAPT PFD · ND · 综合显示</div>
+      </div>
+      <div class="pfd-panel-body" id="pfdPanelBody">
+      <div class="pfd-captions">
+        <span>空速 IAS</span>
+        <span>姿态 ADI</span>
+        <span>高度 ALT</span>
+        <span>导航 ARC · ND</span>
+      </div>
+      <div class="pfd-row">
+        <div class="tape tape-speed" id="speedTapeBox" aria-label="空速带 IAS">
+          <span class="tape-unit">IAS</span>
+          <div class="tape-inner" id="speedTapeInner"></div>
+          <div class="tape-ref" aria-hidden="true"></div>
+          <div class="tape-ptr" aria-hidden="true"></div>
+          <div class="tape-window" id="speedBug">—</div>
+        </div>
+        <div class="att-wrap" id="attWrap">
+          <div class="att-bank" id="attBank">
+            <div class="att-pitch" id="attPitch">
+              <div class="att-sky"></div>
+              <div class="att-grnd"></div>
+              <div class="att-terrain-svs" id="attTerrain" aria-hidden="true">
+                <svg viewBox="0 0 400 720" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+                  <defs>
+                    <linearGradient id="adiTerrGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stop-color="#6a9a58"/>
+                      <stop offset="22%" stop-color="#4a7540"/>
+                      <stop offset="55%" stop-color="#344f2e"/>
+                      <stop offset="100%" stop-color="#1c2818"/>
+                    </linearGradient>
+                  </defs>
+                  <path id="attTerrainFill" fill="url(#adiTerrGrad)" opacity="0.92" d="M0,720 L0,400 L400,400 L400,720 Z"/>
+                  <path id="attTerrainStroke" fill="none" stroke="rgba(45,68,40,0.42)" stroke-width="1" d="M0,400 L400,400"/>
+                </svg>
+              </div>
+              <div class="att-horiz"></div>
+              <div id="pitchLadder"></div>
+              <div class="att-runway-svs" id="attRunwayLayer" aria-hidden="true">
+                <svg viewBox="0 0 400 720" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+                  <defs>
+                    <filter id="adiRwGlow" x="-25%" y="-25%" width="150%" height="150%">
+                      <feGaussianBlur in="SourceGraphic" stdDeviation="0.9" result="g"/>
+                      <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
+                    </filter>
+                  </defs>
+                  <g id="adiRunwayOverlay" filter="url(#adiRwGlow)"></g>
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="att-hud-readouts" aria-hidden="true">
+            <div class="adi-read adi-read-tl"><span>IAS</span><b id="adiIas">—</b></div>
+            <div class="adi-read adi-read-tr"><span>ALT</span><b id="adiAlt">—</b></div>
+            <div class="adi-read adi-read-ml"><span>V/S</span><b id="adiVs">—</b></div>
+            <div class="adi-read adi-read-mr"><span>HDG</span><b id="adiHdg">—</b></div>
+            <div class="adi-read adi-read-bl"><span>TERR·MSL</span><b id="adiGelev">—</b></div>
+            <div class="adi-read adi-read-br"><span>AGL / RAD</span><b id="adiAgl">—</b><span class="adi-sub" id="adiRadSub"></span></div>
+            <div class="adi-read adi-read-bc"><span>BANK</span><b id="adiBank">—</b></div>
+          </div>
+          <div class="att-symbol">
+            <div class="att-ref-lwing" aria-hidden="true"></div>
+            <div class="att-ref-rwing" aria-hidden="true"></div>
+            <div class="att-ref-center" aria-hidden="true"></div>
+          </div>
+        </div>
+        <div class="tape tape-alt" id="altTapeBox" aria-label="高度带 ALT">
+          <span class="tape-unit">ALT</span>
+          <div class="tape-inner" id="altTapeInner"></div>
+          <div class="tape-ref" aria-hidden="true"></div>
+          <div class="tape-ptr" aria-hidden="true"></div>
+          <div class="tape-window tape-window-alt" id="altBug">—</div>
+        </div>
+        <div class="nd-inline" id="ndPanel" aria-label="导航显示 ARC">
+          <button type="button" class="nd-plan-toggle" id="ndPlanToggle" title="PLAN：真北向上、缩放显示前方整段航线" aria-pressed="false">PLAN</button>
+          <div class="nd-plan-zoom" id="ndPlanZoomBar" hidden>
+            <button type="button" class="nd-plan-zoom-btn" id="ndPlanZoomIn" title="放大" aria-label="PLAN 放大">+</button>
+            <span class="nd-plan-zoom-lbl" id="ndPlanZoomLbl">×1.0</span>
+            <button type="button" class="nd-plan-zoom-btn" id="ndPlanZoomOut" title="缩小" aria-label="PLAN 缩小">−</button>
+          </div>
+          <canvas id="ndCanvas" width="236" height="218"></canvas>
+        </div>
+      </div>
+      <div class="pfd-vnav-outer" id="pfdVnavOuter" hidden>
+        <div class="pfd-vnav-strip" id="attVnavStrip" aria-hidden="true">
+          <canvas id="adiVnavCanvas" width="248" height="56"></canvas>
+        </div>
+      </div>
+      <div class="pfd-footer">
+        <span><strong>HDG</strong> <span id="pfdHdg">—</span>°</span>
+        <span><strong>V/S</strong> <span id="pfdVs">—</span> fpm</span>
+        <span><strong>GS</strong> <span id="pfdGs">—</span> kt</span>
+      </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="app.js"></script>
+</body>
+</html>
