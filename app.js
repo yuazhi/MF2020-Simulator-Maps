@@ -1392,11 +1392,18 @@
   const SMOOTH_TAU_MAIN_MS = 245;
   const SMOOTH_K_MAIN_CAP = 0.34;
   let tapeDispReady = false;
-  /** PFD 上下滚动：空速/高度带 + 俯仰平移，rAF 指数缓跟（数据源仍为 SimConnect 包） */
-  const PFD_VERT_TAU_MS = 130;
-  const PFD_VERT_K_CAP = 0.42;
-  let pfdVertReady = false;
-  let lastPfdVertT = 0;
+  /** PFD 上下向显示缓动：遥测仍直连，仅俯仰/空速带/高度带 rAF 插值 */
+  let pfdTgtPitch = 0,
+    pfdTgtBank = 0,
+    pfdTgtIas,
+    pfdTgtAlt;
+  let pfdDispPitch = 0,
+    pfdDispIas,
+    pfdDispAlt;
+  let pfdAnimReady = false;
+  let pfdAnimLastT = 0;
+  const PFD_ANIM_TAU_MS = 150;
+  const PFD_ANIM_K_CAP = 0.42;
   /** 遥测包仅作观测；积分外推 + 残差分帧消化（包到达不瞬时硬拉） */
   const MOTION_MAX_STEP_MS = 100;
   const OBS_VEL_BLEND = 0.52;
@@ -2587,10 +2594,58 @@
     g.innerHTML = html;
   }
 
+  function resetPfdVerticalAnim() {
+    pfdAnimReady = false;
+    pfdAnimLastT = 0;
+    pfdDispPitch = 0;
+    pfdDispIas = null;
+    pfdDispAlt = null;
+  }
+
+  function syncPfdVerticalAnimTargets(data) {
+    pfdTgtPitch = data.pitch_deg != null && Number.isFinite(data.pitch_deg) ? data.pitch_deg : 0;
+    pfdTgtBank = data.bank_deg != null && Number.isFinite(data.bank_deg) ? data.bank_deg : 0;
+    pfdTgtIas = data.ias_knots;
+    pfdTgtAlt = data.alt_ft;
+    if (!pfdAnimReady) {
+      pfdDispPitch = pfdTgtPitch;
+      pfdDispIas = pfdTgtIas;
+      pfdDispAlt = pfdTgtAlt;
+      pfdAnimReady = true;
+      updateAttitude(pfdDispPitch, pfdTgtBank);
+      updateSpeedTape(pfdDispIas);
+      updateAltTape(pfdDispAlt);
+    }
+  }
+
+  function tickPfdVerticalAnim(now) {
+    requestAnimationFrame(tickPfdVerticalAnim);
+    if (!pfdAnimReady || !lastTelemetry || !lastTelemetry.ok) {
+      pfdAnimLastT = 0;
+      return;
+    }
+    const t = typeof now === "number" ? now : performance.now();
+    const dtMs =
+      pfdAnimLastT <= 0 ? 1000 / 60 : Math.min(48, Math.max(0, t - pfdAnimLastT));
+    pfdAnimLastT = t;
+    const k = Math.min(PFD_ANIM_K_CAP, 1 - Math.exp(-dtMs / PFD_ANIM_TAU_MS));
+    function step(cur, tgt) {
+      if (tgt == null || !Number.isFinite(tgt)) return cur;
+      const d0 = cur != null && Number.isFinite(cur) ? cur : tgt;
+      return d0 + (tgt - d0) * k;
+    }
+    pfdDispPitch = step(pfdDispPitch, pfdTgtPitch);
+    pfdDispIas = step(pfdDispIas, pfdTgtIas);
+    pfdDispAlt = step(pfdDispAlt, pfdTgtAlt);
+    updateAttitude(pfdDispPitch, pfdTgtBank);
+    updateSpeedTape(pfdDispIas);
+    updateAltTape(pfdDispAlt);
+  }
+
   /** PFD：SimConnect 仪表 SimVar（INDICATED ALTITUDE / HEADING INDICATOR 等，与 G1000/G3000 同源）；Events 仅用于按键 */
   function updatePfdInstruments(data) {
     if (!data || !data.ok) {
-      resetPfdVertSmooth();
+      resetPfdVerticalAnim();
       updateSpeedTape(null);
       updateAltTape(null);
       updateAttitude(0, 0);
@@ -2601,22 +2656,7 @@
       redrawAdiVnavProfile();
       return;
     }
-    if (!pfdVertReady) {
-      snapPfdVertDispFromTargets();
-    } else {
-      const tpNow =
-        data.pitch_deg != null && Number.isFinite(data.pitch_deg) ? data.pitch_deg : 0;
-      if (
-        (dispAlt != null &&
-          tgtAlt != null &&
-          Number.isFinite(dispAlt) &&
-          Number.isFinite(tgtAlt) &&
-          Math.abs(tgtAlt - dispAlt) > 12000) ||
-        Math.abs(tpNow - dispPitch) > 50
-      ) {
-        snapPfdVertDispFromTargets();
-      }
-    }
+    syncPfdVerticalAnimTargets(data);
     updateAdiHud(
       data.ias_knots,
       data.alt_ft,
@@ -2648,47 +2688,6 @@
     );
     updatePfdNdToolbarStats(data);
     redrawAdiVnavProfile();
-  }
-
-  function resetPfdVertSmooth() {
-    pfdVertReady = false;
-    lastPfdVertT = 0;
-  }
-
-  function snapPfdVertDispFromTargets() {
-    dispPitch = tgtPitch != null && Number.isFinite(tgtPitch) ? tgtPitch : 0;
-    dispIas = tgtIas;
-    dispAlt = tgtAlt;
-    pfdVertReady = true;
-    lastPfdVertT = 0;
-  }
-
-  /** 仅驱动 PFD 垂直向动画：俯仰平移 + 空速/高度带滚动 */
-  function tickPfdVerticalSmooth(now) {
-    requestAnimationFrame(tickPfdVerticalSmooth);
-    if (!lastTelemetry || !lastTelemetry.ok || !pfdVertReady) {
-      lastPfdVertT = 0;
-      return;
-    }
-    const t = typeof now === "number" ? now : performance.now();
-    const dtMs =
-      lastPfdVertT <= 0 ? 1000 / 60 : Math.min(48, Math.max(0, t - lastPfdVertT));
-    lastPfdVertT = t;
-    const k = Math.min(PFD_VERT_K_CAP, 1 - Math.exp(-dtMs / PFD_VERT_TAU_MS));
-    const tp = tgtPitch != null && Number.isFinite(tgtPitch) ? tgtPitch : 0;
-    dispPitch = dispPitch + (tp - dispPitch) * k;
-    if (tgtIas != null && Number.isFinite(tgtIas)) {
-      const d0 = dispIas != null && Number.isFinite(dispIas) ? dispIas : tgtIas;
-      dispIas = d0 + (tgtIas - d0) * k;
-    }
-    if (tgtAlt != null && Number.isFinite(tgtAlt)) {
-      const d0 = dispAlt != null && Number.isFinite(dispAlt) ? dispAlt : tgtAlt;
-      dispAlt = d0 + (tgtAlt - d0) * k;
-    }
-    const bankNow = tgtBank != null && Number.isFinite(tgtBank) ? tgtBank : 0;
-    updateAttitude(dispPitch, bankNow);
-    updateSpeedTape(dispIas);
-    updateAltTape(dispAlt);
   }
 
   function fmtNum(n, d) {
@@ -7105,7 +7104,6 @@
       if (!reconnecting) {
         smoothReady = false;
         tapeDispReady = false;
-        resetPfdVertSmooth();
         resetMotion();
         lastSmoothT = 0;
         dispPitch = 0;
@@ -7231,7 +7229,6 @@
       lastTelemetry = { ok: false };
       smoothReady = false;
       tapeDispReady = false;
-      resetPfdVertSmooth();
       resetMotion();
       lastSmoothT = 0;
       dispPitch = 0;
@@ -7721,5 +7718,5 @@
     scheduleMapLayoutRefresh(false);
     connectStream();
   });
-  requestAnimationFrame(tickPfdVerticalSmooth);
+  requestAnimationFrame(tickPfdVerticalAnim);
 })();
