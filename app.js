@@ -215,7 +215,7 @@
     return L.point(size.x / 2, visibleH * 0.5);
   }
 
-  /** 地图机标：直接用最新遥测包，不做 rAF 积分/预测外推 */
+  /** 地图/航迹：始终用最新遥测包坐标，不走运动预测 */
   function mapAcState() {
     if (!lastTelemetry || !lastTelemetry.ok) return null;
     const lat =
@@ -397,13 +397,12 @@
   const trafficIcon = L.divIcon({
     className: "traffic-marker",
     html:
-      '<div class="traffic-hdg" style="width:12px;height:18px;transform-origin:6px 12px;will-change:transform">' +
+      '<div class="traffic-hdg" style="width:12px;height:18px;transform-origin:6px 9px;will-change:transform">' +
       '<div style="position:absolute;left:50%;bottom:1px;width:0;height:0;margin-left:-6px;' +
       "border-left:6px solid transparent;border-right:6px solid transparent;" +
       'border-bottom:15px solid #ff9f0a;filter:drop-shadow(0 1px 2px rgba(0,0,0,.55))"></div></div>',
     iconSize: [12, 18],
-    iconAnchor: [6, 12],
-    tooltipAnchor: [0, 0]
+    iconAnchor: [6, 9]
   });
 
   let marker = null;
@@ -1361,12 +1360,6 @@
   /** 沿计划航线累积距离已超过该点此后（海里）亦视为飞过，避免侧偏时永远卡在同一航点 */
   const PASS_ALONG_NM = 0.32;
   let lastTelemetry = null;
-  /** 高频 SSE 时限制 ND/航迹等重绘；地图机位仅随遥测包更新，不做平滑外推 */
-  let lastPayloadUiT = 0;
-  let lastPayloadTrailT = 0;
-  let lastPayloadTrailLen = -1;
-  const PAYLOAD_UI_MIN_MS = 90;
-  const PAYLOAD_TRAIL_MIN_MS = 220;
   /** 与 msfs_bridge 上航线版本对齐：电脑/手机同一局域网下共用一条导入的 .pln */
   let planSyncInitialized = false;
   let lastServerPlanRev = null;
@@ -1378,7 +1371,6 @@
   let tgtPitch = 0, tgtBank = 0, tgtIas, tgtAlt, tgtHdg = 0, tgtGs, tgtVs, tgtTrack;
   let dispLat = 0, dispLon = 0;
   let dispPitch = 0, dispBank = 0, dispIas, dispAlt, dispHdg = 0, dispGs, dispVs, dispTrack;
-  let dispTrkShow = null;
   let tgtGroundElevFt = null,
     dispGroundElevFt = null,
     tgtRadioHeightFt = null,
@@ -1397,58 +1389,30 @@
   const OBS_VEL_BLEND = 0.52;
   const OBS_AUX_BLEND = 0.22;
   const OBS_VS_BLEND = 0.34;
-  const OBS_TRACK_BLEND = 0.12;
-  const TRK_SHOW_TAU_MS = 380;
-  const TRK_MOTION_BLEND = 0.16;
-  const TRK_GS_USE_HDG_KT = 8;
+  const OBS_TRACK_BLEND = 0.28;
   /** 修正尽量无感：包上只入库部分误差，帧间慢消化 + 单帧步长上限 */
   const CORRECT_PKT_KEEP = 0.16;
   const CORRECT_RESID_MERGE = 0.68;
-  /** 位置残差消化：遥测已提至 ~60Hz，地图/ND 可更贴机 */
-  const RESID_TAU_POS_S = 0.08;
-  const RESID_TAU_HDG_S = 0.1;
-  const RESID_TAU_SCALAR_S = 0.14;
-  const RESID_STEP_MAX_LAT = 4e-6;
-  const RESID_STEP_MAX_LON = 4e-6;
-  const RESID_STEP_MAX_ALT_FT = 1.2;
-  const RESID_STEP_MAX_HDG_DEG = 0.22;
+  const RESID_TAU_POS_S = 0.34;
+  const RESID_TAU_HDG_S = 0.3;
+  const RESID_TAU_SCALAR_S = 0.3;
+  const RESID_STEP_MAX_LAT = 1.1e-6;
+  const RESID_STEP_MAX_LON = 1.1e-6;
+  const RESID_STEP_MAX_ALT_FT = 0.65;
+  const RESID_STEP_MAX_HDG_DEG = 0.06;
   const RESID_STEP_MAX_IAS_KT = 0.08;
   const RESID_STEP_MAX_GS_KT = 0.08;
   const RESID_STEP_MAX_VS_FPM = 2.5;
-  const RESID_STEP_MAX_PITCH_DEG = 0.14;
-  const RESID_STEP_MAX_BANK_DEG = 0.16;
-  const OBS_PKT_DT_MIN_MS = 5;
+  const RESID_STEP_MAX_PITCH_DEG = 0.32;
+  const RESID_STEP_MAX_BANK_DEG = 0.38;
+  const OBS_PKT_DT_MIN_MS = 16;
   const OBS_PKT_DT_MAX_MS = 8000;
   /** 换机位/传送：位置突变则硬重置运动状态，避免积分把仪表甩飞 */
   const MOTION_RESET_JUMP_NM = 1.8;
-  /** PFD 姿态：遥测锚点 + 低通角速度外推，双层帧间阻尼 */
-  const PFD_ATT_PREDICT_LEAD_MS = 55;
-  const PFD_ATT_MAX_PREDICT_MS = 260;
-  const PFD_ATT_TARGET_RATE = 16;
-  const PFD_ATT_SMOOTH_RATE = 19;
-  const PFD_ATT_SNAP_GAP_MS = 1200;
-  const PFD_ATT_RATE_MAX_PITCH = 24;
-  const PFD_ATT_RATE_MAX_BANK = 36;
-  const OBS_ATT_VEL_BLEND = 0.26;
-  const CORRECT_PKT_KEEP_ATT = 0.09;
-  const RESID_TAU_ATT_S = 0.24;
-  const VNAV_DRAW_INTERVAL = 120;
-  const PFD_TERRAIN_INTERVAL = 150;
-  const PFD_RUNWAY_INTERVAL = 100;
   let motion = null;
   let motionResidual = null;
   let lastObs = null;
   let lastSmoothT = 0;
-  let pfdAttDraw = null;
-  let pfdAttTarget = null;
-  let pfdAttLastFrameT = performance.now();
-  let pfdSmoothPitchDps = 0;
-  let pfdSmoothBankDps = 0;
-  let lastSpeedTapeValue = null;
-  let lastAltTapeValue = null;
-  let lastVnavDrawT = 0;
-  let lastPfdTerrainT = 0;
-  let lastPfdRunwayT = 0;
 
   function queueCorrection(prev, fresh, keep, merge) {
     if (!Number.isFinite(fresh)) return prev;
@@ -1475,101 +1439,6 @@
     while (d > 180) d -= 360;
     while (d < -180) d += 360;
     return d;
-  }
-
-  function clampNum(v, lo, hi) {
-    if (!Number.isFinite(v)) return lo;
-    return Math.max(lo, Math.min(hi, v));
-  }
-
-  function lerp(a, b, k) {
-    if (!Number.isFinite(a)) return b;
-    if (!Number.isFinite(b)) return a;
-    return a + (b - a) * k;
-  }
-
-  function lerpAngle(a, b, k) {
-    if (!Number.isFinite(a)) return b;
-    if (!Number.isFinite(b)) return a;
-    return normHdg(a + deltaAngleDeg(a, b) * k);
-  }
-
-  function smoothStep(cur, target, dt, rate) {
-    const k = 1 - Math.exp(-rate * dt);
-    return lerp(cur, target, k);
-  }
-
-  function smoothStepAngle(cur, target, dt, rate) {
-    const k = 1 - Math.exp(-rate * dt);
-    return lerpAngle(cur, target, k);
-  }
-
-  function smoothStepBank(cur, target, dt, rate) {
-    const k = 1 - Math.exp(-rate * dt);
-    if (!Number.isFinite(cur)) return target;
-    if (!Number.isFinite(target)) return cur;
-    return cur + deltaAngleDeg(cur, target) * k;
-  }
-
-  function resetPfdAttDraw() {
-    pfdAttDraw = null;
-    pfdAttTarget = null;
-    pfdAttLastFrameT = performance.now();
-    pfdSmoothPitchDps = 0;
-    pfdSmoothBankDps = 0;
-    lastSpeedTapeValue = null;
-    lastAltTapeValue = null;
-    lastVnavDrawT = 0;
-    lastPfdTerrainT = 0;
-    lastPfdRunwayT = 0;
-  }
-
-  /** 俯仰/横滚：遥测锚 + 低通角速度外推 + 双层帧间阻尼（两轴同算法） */
-  function getPredictedPfdPitch(now) {
-    let pitch = tgtPitch != null && Number.isFinite(tgtPitch) ? tgtPitch : 0;
-    if (lastObs && lastObs.t) {
-      const ageMs = now - lastObs.t;
-      const predictMs = clampNum(ageMs + PFD_ATT_PREDICT_LEAD_MS, 0, PFD_ATT_MAX_PREDICT_MS);
-      pitch += pfdSmoothPitchDps * (predictMs / 1000);
-      pitch = clampNum(pitch, -85, 85);
-    }
-    return pitch;
-  }
-
-  function getPredictedPfdBank(now) {
-    let bank = tgtBank != null && Number.isFinite(tgtBank) ? tgtBank : 0;
-    if (lastObs && lastObs.t) {
-      const ageMs = now - lastObs.t;
-      const predictMs = clampNum(ageMs + PFD_ATT_PREDICT_LEAD_MS, 0, PFD_ATT_MAX_PREDICT_MS);
-      bank += pfdSmoothBankDps * (predictMs / 1000);
-    }
-    return bank;
-  }
-
-  function updatePfdAttitudeDraw(now) {
-    const dt = clampNum((now - pfdAttLastFrameT) / 1000, 0.001, 0.05);
-    pfdAttLastFrameT = now;
-    const rawPitch = getPredictedPfdPitch(now);
-    const rawBank = getPredictedPfdBank(now);
-
-    if (!pfdAttDraw) {
-      pfdAttTarget = { pitch: rawPitch, bank: rawBank };
-      pfdAttDraw = { pitch: rawPitch, bank: rawBank };
-      return pfdAttDraw;
-    }
-    const dataGap = lastObs && lastObs.t ? now - lastObs.t : 9999;
-    if (dataGap > PFD_ATT_SNAP_GAP_MS) {
-      pfdAttTarget.pitch = rawPitch;
-      pfdAttTarget.bank = rawBank;
-      pfdAttDraw.pitch = rawPitch;
-      pfdAttDraw.bank = rawBank;
-      return pfdAttDraw;
-    }
-    pfdAttTarget.pitch = smoothStep(pfdAttTarget.pitch, rawPitch, dt, PFD_ATT_TARGET_RATE);
-    pfdAttTarget.bank = smoothStepBank(pfdAttTarget.bank, rawBank, dt, PFD_ATT_TARGET_RATE);
-    pfdAttDraw.pitch = smoothStep(pfdAttDraw.pitch, pfdAttTarget.pitch, dt, PFD_ATT_SMOOTH_RATE);
-    pfdAttDraw.bank = smoothStepBank(pfdAttDraw.bank, pfdAttTarget.bank, dt, PFD_ATT_SMOOTH_RATE);
-    return pfdAttDraw;
   }
 
   function telemetryToAnchor(data) {
@@ -1614,28 +1483,7 @@
   }
 
   function motionCourseDeg(m) {
-    const gs = m.gs != null && Number.isFinite(m.gs) ? m.gs : 0;
-    if (gs < TRK_GS_USE_HDG_KT) return m.hdg;
     return m.track != null && Number.isFinite(m.track) ? m.track : m.hdg;
-  }
-
-  function stepDispTrkShow(obs, dtMs) {
-    if (obs == null || !Number.isFinite(obs)) return;
-    if (dispTrkShow == null || !Number.isFinite(dispTrkShow)) {
-      dispTrkShow = normHdg(obs);
-      return;
-    }
-    const k = Math.min(0.22, 1 - Math.exp(-dtMs / TRK_SHOW_TAU_MS));
-    dispTrkShow = normHdg(dispTrkShow + deltaAngleDeg(dispTrkShow, obs) * k);
-  }
-
-  function trkObsFromAnchor(z, gsKt) {
-    if (gsKt != null && Number.isFinite(gsKt) && gsKt < TRK_GS_USE_HDG_KT) {
-      return z.hdg != null && Number.isFinite(z.hdg) ? z.hdg : null;
-    }
-    if (z.track != null && Number.isFinite(z.track)) return z.track;
-    if (z.hdg != null && Number.isFinite(z.hdg)) return z.hdg;
-    return null;
   }
 
   function motionFromObservation(z) {
@@ -1684,16 +1532,8 @@
     const dtMin = dtMs / 60000;
     const out = {
       hdgDps: deltaAngleDeg(a.hdg, b.hdg) / dtS,
-      pitchDps: clampNum(
-        ((b.pitch || 0) - (a.pitch || 0)) / dtS,
-        -PFD_ATT_RATE_MAX_PITCH,
-        PFD_ATT_RATE_MAX_PITCH
-      ),
-      bankDps: clampNum(
-        deltaAngleDeg(a.bank, b.bank) / dtS,
-        -PFD_ATT_RATE_MAX_BANK,
-        PFD_ATT_RATE_MAX_BANK
-      ),
+      pitchDps: ((b.pitch || 0) - (a.pitch || 0)) / dtS,
+      bankDps: deltaAngleDeg(a.bank, b.bank) / dtS,
       iasKtPerS: 0,
       gsKtPerS: 0,
       vsFpm: null,
@@ -1728,9 +1568,7 @@
     while (dLon < -180) dLon += 360;
     const eastNmPerMin = (dLon * 60 * Math.cos((latMid * Math.PI) / 180)) / dtMin;
     const gsFromPos = Math.hypot(northNmPerMin, eastNmPerMin) * 60;
-    if (b.track != null && Number.isFinite(b.track)) {
-      out.track = normHdg(b.track);
-    } else if (gsFromPos > 2) {
+    if (gsFromPos > 2) {
       out.track = normHdg((Math.atan2(eastNmPerMin, northNmPerMin) * 180) / Math.PI);
       if (
         (out.gsKtPerS === 0 || !Number.isFinite(out.gsKtPerS)) &&
@@ -1739,8 +1577,8 @@
       ) {
         out.gsKtPerS = (gsFromPos - a.gs) / dtS;
       }
-    } else if (b.hdg != null && Number.isFinite(b.hdg)) {
-      out.track = normHdg(b.hdg);
+    } else if (b.track != null && Number.isFinite(b.track)) {
+      out.track = b.track;
     }
     return out;
   }
@@ -1827,13 +1665,13 @@
       r.pitch,
       (z.pitch != null && Number.isFinite(z.pitch) ? z.pitch : 0) -
         (m.pitch != null && Number.isFinite(m.pitch) ? m.pitch : 0),
-      CORRECT_PKT_KEEP_ATT,
+      CORRECT_PKT_KEEP,
       CORRECT_RESID_MERGE
     );
     r.bank = queueCorrection(
       r.bank,
       deltaAngleDeg(m.bank, z.bank),
-      CORRECT_PKT_KEEP_ATT,
+      CORRECT_PKT_KEEP,
       CORRECT_RESID_MERGE
     );
     const freshIas =
@@ -1873,7 +1711,6 @@
     const kPos = 1 - Math.exp(-dtS / RESID_TAU_POS_S);
     const kHdg = 1 - Math.exp(-dtS / RESID_TAU_HDG_S);
     const kSc = 1 - Math.exp(-dtS / RESID_TAU_SCALAR_S);
-    const kAtt = 1 - Math.exp(-dtS / RESID_TAU_ATT_S);
 
     const bl = bleedResidualStep(r.lat, kPos, RESID_STEP_MAX_LAT);
     m.lat += bl.step;
@@ -1893,12 +1730,12 @@
     r.hdg = bh.left;
 
     if (m.pitch != null && Number.isFinite(m.pitch)) {
-      const bp = bleedResidualStep(r.pitch, kAtt, RESID_STEP_MAX_PITCH_DEG);
+      const bp = bleedResidualStep(r.pitch, kSc, RESID_STEP_MAX_PITCH_DEG);
       m.pitch += bp.step;
       r.pitch = bp.left;
     }
     if (m.bank != null && Number.isFinite(m.bank)) {
-      const bb = bleedResidualStep(r.bank, kAtt, RESID_STEP_MAX_BANK_DEG);
+      const bb = bleedResidualStep(r.bank, kSc, RESID_STEP_MAX_BANK_DEG);
       m.bank += bb.step;
       r.bank = bb.left;
     }
@@ -1956,8 +1793,6 @@
     motion = null;
     motionResidual = null;
     lastObs = null;
-    dispTrkShow = null;
-    resetPfdAttDraw();
   }
 
   function observationNeedsMotionReset(prevZ, z) {
@@ -1976,8 +1811,6 @@
     applyMotionToDisp(motion);
     dispPitch = motion.pitch;
     dispBank = motion.bank;
-    const trk0 = trkObsFromAnchor(z, z.gs);
-    dispTrkShow = trk0 != null ? normHdg(trk0) : null;
     dispIas = z.ias;
     dispAlt = z.alt;
     tapeDispReady = true;
@@ -2001,21 +1834,8 @@
     }
 
     if (dtMs >= OBS_PKT_DT_MIN_MS && dtMs <= OBS_PKT_DT_MAX_MS) {
-      const v = measureVelocitiesFromObs(lastObs.z, z, dtMs);
-      blendMotionVelocities(motion, v, OBS_VEL_BLEND);
-      pfdSmoothPitchDps += (v.pitchDps - pfdSmoothPitchDps) * OBS_ATT_VEL_BLEND;
-      pfdSmoothBankDps += (v.bankDps - pfdSmoothBankDps) * OBS_ATT_VEL_BLEND;
-      pfdSmoothPitchDps = clampNum(
-        pfdSmoothPitchDps,
-        -PFD_ATT_RATE_MAX_PITCH,
-        PFD_ATT_RATE_MAX_PITCH
-      );
-      pfdSmoothBankDps = clampNum(
-        pfdSmoothBankDps,
-        -PFD_ATT_RATE_MAX_BANK,
-        PFD_ATT_RATE_MAX_BANK
-      );
-    } else if (dtMs > OBS_PKT_DT_MAX_MS) {
+      blendMotionVelocities(motion, measureVelocitiesFromObs(lastObs.z, z, dtMs), OBS_VEL_BLEND);
+    } else {
       motion.pitch = z.pitch;
       motion.bank = z.bank;
       motion.pitchDps = 0;
@@ -2027,19 +1847,8 @@
           motion.vs = z.vs;
         }
       }
-      resetPfdAttDraw();
     }
     blendMotionAuxFromObs(motion, z, OBS_AUX_BLEND);
-    const trkObs = trkObsFromAnchor(z, z.gs);
-    if (trkObs != null) {
-      if (motion.track == null || !Number.isFinite(motion.track)) {
-        motion.track = trkObs;
-      } else {
-        motion.track = normHdg(
-          motion.track + deltaAngleDeg(motion.track, trkObs) * TRK_MOTION_BLEND
-        );
-      }
-    }
     setMotionResidualFromObs(motion, z);
     lastObs = { t: tNow, z: z };
   }
@@ -2061,20 +1870,8 @@
     integrateMotionStep(motion, dtS);
     bleedMotionResidual(motion, dtS);
     applyMotionToDisp(motion);
-    const trkUiObs =
-      tgtTrack != null && Number.isFinite(tgtTrack)
-        ? tgtTrack
-        : lastTelemetry && lastTelemetry.ground_track_deg != null
-          ? lastTelemetry.ground_track_deg
-          : trkObsFromAnchor(
-              {
-                track: tgtTrack,
-                hdg: dispHdg,
-                gs: dispGs != null ? dispGs : tgtGs
-              },
-              dispGs != null && Number.isFinite(dispGs) ? dispGs : tgtGs
-            );
-    stepDispTrkShow(trkUiObs, dtMs);
+    dispPitch = motion.pitch;
+    dispBank = motion.bank;
     smoothReady = true;
     const kMain = Math.min(SMOOTH_K_MAIN_CAP, 1 - Math.exp(-dtMs / SMOOTH_TAU_MAIN_MS));
     if (!tapeDispReady) {
@@ -2101,54 +1898,44 @@
     ) {
       dispAglBaroUse = dispAlt - dispGroundElevFt;
     }
-    const att = updatePfdAttitudeDraw(t);
-    const attPitch = att ? att.pitch : motion.pitch;
-    const attBank = att ? att.bank : motion.bank;
-    dispPitch = attPitch;
-    dispBank = attBank;
-    updateAttitude(attPitch, attBank);
-    updateSpeedTapeSmart(dispIas);
-    updateAltTapeSmart(dispAlt);
+    updateAttitude(dispPitch, dispBank);
+    updateSpeedTape(dispIas);
+    updateAltTape(dispAlt);
     updateAdiHud(
       dispIas,
       dispAlt,
       dispVs,
       dispHdg,
-      attBank,
+      dispBank,
       dispGroundElevFt,
       dispRadioHeightFt,
       dispAglBaroUse,
       dispAglGameFt
     );
-    if (t - lastPfdTerrainT >= PFD_TERRAIN_INTERVAL) {
-      lastPfdTerrainT = t;
-      updateAdiTerrain(
-        dispRadioHeightFt,
-        dispAglBaroUse,
-        dispAglGameFt,
-        dispAlt,
-        dispGroundElevFt,
-        dispLat,
-        dispLon
-      );
-    }
+    updateAdiTerrain(
+      dispRadioHeightFt,
+      dispAglBaroUse,
+      dispAglGameFt,
+      dispAlt,
+      dispGroundElevFt,
+      dispLat,
+      dispLon
+    );
     const navRw = navAcState();
-    if (t - lastPfdRunwayT >= PFD_RUNWAY_INTERVAL) {
-      lastPfdRunwayT = t;
-      updateAdiRunwayOverlay(
-        lastTelemetry,
-        attPitch,
-        attBank,
-        dispAlt,
-        navRw ? navRw.hdg : dispHdg,
-        navRw ? navRw.lat : dispLat,
-        navRw ? navRw.lon : dispLon
-      );
-    }
+    updateAdiRunwayOverlay(
+      lastTelemetry,
+      dispPitch,
+      dispBank,
+      dispAlt,
+      navRw ? navRw.hdg : dispHdg,
+      navRw ? navRw.lat : dispLat,
+      navRw ? navRw.lon : dispLon
+    );
     updatePfdNdToolbarStats(lastTelemetry);
-    if (t - lastVnavDrawT >= VNAV_DRAW_INTERVAL) {
-      lastVnavDrawT = t;
-      redrawAdiVnavProfile();
+    redrawAdiVnavProfile();
+    if (planWaypoints.length) {
+      const mapAcPlan = mapAcState();
+      if (mapAcPlan) planHudLine(mapAcPlan.lat, mapAcPlan.lon);
     }
   }
 
@@ -2323,34 +2110,6 @@
     }
   }
 
-  function updateSpeedTapeSmart(ias) {
-    if (ias == null || !Number.isFinite(ias)) {
-      if (lastSpeedTapeValue !== null) {
-        lastSpeedTapeValue = null;
-        updateSpeedTape(null);
-      }
-      return;
-    }
-    const v = Math.round(ias * 2) / 2;
-    if (v === lastSpeedTapeValue) return;
-    lastSpeedTapeValue = v;
-    updateSpeedTape(ias);
-  }
-
-  function updateAltTapeSmart(altFt) {
-    if (altFt == null || !Number.isFinite(altFt)) {
-      if (lastAltTapeValue !== null) {
-        lastAltTapeValue = null;
-        updateAltTape(null);
-      }
-      return;
-    }
-    const v = Math.round(altFt / 10);
-    if (v === lastAltTapeValue) return;
-    lastAltTapeValue = v;
-    updateAltTape(altFt);
-  }
-
   function updateSpeedTape(ias) {
     const inner = document.getElementById("speedTapeInner");
     const bug = document.getElementById("speedBug");
@@ -2440,9 +2199,8 @@
     const p = pitch != null && Number.isFinite(pitch) ? pitch : 0;
     const b = bank != null && Number.isFinite(bank) ? bank : 0;
     /* 俯仰与 SimConnect 符号相反需取反平移；横滚左右与 CSS 约定一致用正值=顺时针坡度 */
-    bEl.style.transform = "translateZ(0) rotate(" + b.toFixed(2) + "deg)";
-    pEl.style.transform =
-      "translateZ(0) translateY(" + (-p * PITCH_PX_PER_DEG).toFixed(2) + "px)";
+    bEl.style.transform = "translateZ(0) rotate(" + b + "deg)";
+    pEl.style.transform = "translateZ(0) translateY(" + -p * PITCH_PX_PER_DEG + "px)";
   }
 
   /** 地形/AGL：低空优先无线电，否则用模拟器几何 AGL（与游戏一致），再退回气压近似 */
@@ -2880,18 +2638,12 @@
         ? " · " + Math.round(mapAc.alt) + " ft"
         : "");
     const planeTip = marker.getTooltip();
-    if (planeTip) {
-      marker.setTooltipContent(posTip);
-      const off = [-6, -10];
-      if (!planeTip.options.offset || planeTip.options.offset[0] !== off[0]) {
-        planeTip.options.offset = off;
-        planeTip.update();
-      }
-    } else {
+    if (planeTip) marker.setTooltipContent(posTip);
+    else {
       marker.bindTooltip(posTip, {
         permanent: true,
         direction: "top",
-        offset: [-6, -10],
+        offset: [0, -10],
         className: "plane-pos-tip",
         sticky: false
       });
@@ -3418,26 +3170,6 @@
     });
   }
 
-  function trafficTooltipOffsetPx(hdgIn) {
-    const hdg = normalizeTrafficHeadingDeg(hdgIn);
-    const h = ((hdg != null ? hdg : 0) * Math.PI) / 180;
-    const left = 5;
-    const aftR = 4;
-    const lift = 15;
-    return [-Math.sin(h) * aftR - left, Math.cos(h) * aftR - lift];
-  }
-
-  function syncTrafficTooltipPosition(m, ac) {
-    if (!m) return;
-    const tip = m.getTooltip && m.getTooltip();
-    if (!tip) return;
-    const off = trafficTooltipOffsetPx(ac && ac.heading_deg);
-    const prev = tip.options.offset || [0, 0];
-    if (prev[0] === off[0] && prev[1] === off[1]) return;
-    tip.options.offset = off;
-    if (m.isTooltipOpen && m.isTooltipOpen()) tip.update();
-  }
-
   function ensureTrafficTooltip(m, id, ac) {
     if (!m || !ac) return;
     const sid = String(id);
@@ -3454,7 +3186,7 @@
       if (m.getTooltip()) m.unbindTooltip();
       m.bindTooltip(text, {
         direction: "top",
-        offset: trafficTooltipOffsetPx(ac.heading_deg),
+        offset: [0, -8],
         opacity: 0.92,
         className: "traffic-tip" + (pinned ? " traffic-tip--pinned" : ""),
         permanent: pinned,
@@ -3464,7 +3196,6 @@
       m._mfTooltipPinned = pinned;
     } else {
       m.setTooltipContent(text);
-      syncTrafficTooltipPosition(m, ac);
     }
     if (pinned) {
       if (!m.isTooltipOpen()) m.openTooltip();
@@ -3535,7 +3266,6 @@
       if (wrap && ac.heading_deg != null && Number.isFinite(ac.heading_deg)) {
         applyTrafficMarkerHeading(wrap, id, ac.heading_deg);
       }
-      syncTrafficTooltipPosition(m, ac);
       const rootEl = m.getElement();
       applyTrafficMarkerStyle(rootEl, trafficDisplayStyle(ac, lastTelemetry));
       ensureTrafficTooltip(m, id, ac);
@@ -4223,13 +3953,13 @@
   const ND_GND_ZOOM_DISP_MAX = 5;
   const ND_GND_ZOOM_DISP_DEFAULT = 1;
   const ND_GND_ZOOM_DISP_STEP = 1;
-  /** 底图缩放仍按内部档 5～10 计算（×1→5，×5→10） */
+  /** 底图缩放仍按内部档 5～10 计算（×1→6，×5→10） */
   const ND_GND_SCALE_INTERNAL_MIN = 5;
   const ND_GND_SCALE_INTERNAL_MAX = 10;
-  const ND_GND_SCALE_INTERNAL_DEFAULT = 5;
+  const ND_GND_SCALE_INTERNAL_DEFAULT = 6;
 
-  /** 显示倍率映射到底图缩放系数：×1 用 SCALE_MIN，×5 用 SCALE_MAX */
-  const ND_GND_SCALE_MIN = 0.82;
+  /** 显示倍率映射到底图缩放系数：跑道底图可继续放大 */
+  const ND_GND_SCALE_MIN = 1.05;
   const ND_GND_SCALE_MAX = 2.85;
 
   /** 整体尺寸增强：控制基础大小，不建议超过 4.5 */
@@ -4241,7 +3971,7 @@
     return Math.max(min, Math.min(max, v));
   }
 
-  /** UI ×1～×5 → 内部缩放档 5～10（×1 默认更小，×5 最大不变） */
+  /** UI ×1～×5 → 内部缩放档 6～10（×1 默认略小，×5 最大不变） */
   function ndGndUiToScaleInternal(uiDisp) {
     const d = ndGndClamp(uiDisp, ND_GND_ZOOM_DISP_MIN, ND_GND_ZOOM_DISP_MAX);
     const uiSpan = ND_GND_ZOOM_DISP_MAX - ND_GND_ZOOM_DISP_MIN;
@@ -5935,8 +5665,7 @@
       tasEl.textContent = tas != null ? String(tas) : "—";
     }
     let trk = null;
-    if (dispTrkShow != null && Number.isFinite(dispTrkShow)) trk = normHdg(dispTrkShow);
-    else if (smoothReady && dispTrack != null && Number.isFinite(dispTrack)) trk = normHdg(dispTrack);
+    if (smoothReady && dispTrack != null && Number.isFinite(dispTrack)) trk = normHdg(dispTrack);
     else if (t) {
       if (t.ground_track_deg != null && Number.isFinite(t.ground_track_deg)) trk = normHdg(t.ground_track_deg);
       else if (t.heading_deg != null && Number.isFinite(t.heading_deg)) trk = normHdg(t.heading_deg);
@@ -6099,15 +5828,11 @@
             : 0
       );
       trkN = null;
-      if (dispTrkShow != null && Number.isFinite(dispTrkShow)) {
-        trkN = normHdg(dispTrkShow);
-      } else {
-        const trkUse =
-          tgtTrack != null && Number.isFinite(tgtTrack)
-            ? tgtTrack
-            : lastTelemetry.ground_track_deg;
-        if (trkUse != null && Number.isFinite(trkUse)) trkN = normHdg(trkUse);
-      }
+      const trkUse =
+        tgtTrack != null && Number.isFinite(tgtTrack)
+          ? tgtTrack
+          : lastTelemetry.ground_track_deg;
+      if (trkUse != null && Number.isFinite(trkUse)) trkN = normHdg(trkUse);
       compassRef = hdgN;
       if (planWaypoints.length) advanceWaypoints(acLat, acLon);
     } else if (planWaypoints.length >= 2) {
@@ -7215,20 +6940,16 @@
     if (data && data.ok) normalizeTelemetryHeadingMag(data);
     if (!data.ok) {
       lastTelemetry = data;
-      const reconnecting =
-        data.error && String(data.error).indexOf("重连") >= 0;
-      if (!reconnecting) {
-        smoothReady = false;
-        tapeDispReady = false;
-        resetMotion();
-        lastSmoothT = 0;
-        dispPitch = 0;
-        dispBank = 0;
-        stabilizeTrafficList([], null, null, null);
-        updateTraffic([]);
-        updateCollisionWarnings(null);
-        updateTcassSuppressMapOverlay(null);
-      }
+      smoothReady = false;
+      tapeDispReady = false;
+      resetMotion();
+      lastSmoothT = 0;
+      dispPitch = 0;
+      dispBank = 0;
+      stabilizeTrafficList([], null, null, null);
+      updateTraffic([]);
+      updateCollisionWarnings(null);
+      updateTcassSuppressMapOverlay(null);
       /* 短时断流仍带航迹：有 trail 则保留绿线，无字段或空数组才清空，避免飞一半整段消失 */
       if (Array.isArray(data.trail)) {
         if (data.trail.length >= 2) {
@@ -7239,18 +6960,10 @@
       resetNdWxSweepAnim();
       ndWxSweepPos = 1;
       ndWxSweepDone = true;
-      if (!reconnecting) {
-        redrawNd();
-        redrawAdiVnavProfile();
-      }
+      redrawNd();
+      redrawAdiVnavProfile();
       syncNdToolbarChrome();
-      setStatus(
-        reconnecting,
-        reconnecting ? "SimConnect 重连中…" : data.error || "未知错误",
-        reconnecting
-          ? "连接曾短暂中断，约 1 秒内自动恢复；请保持模拟飞行运行。"
-          : "请确认已运行 启动.bat 且模拟飞行已进入驾驶舱。"
-      );
+      setStatus(false, data.error || "未知错误", "请确认已运行 启动.bat 且模拟飞行已进入驾驶舱。");
       return;
     }
     const lat = data.lat;
@@ -7268,18 +6981,8 @@
       scheduleMapLayoutRefresh(true);
     }
 
-    const uiNow = performance.now();
-    const doUi = uiNow - lastPayloadUiT >= PAYLOAD_UI_MIN_MS;
     const trail = (data.trail || []).map(function (p) { return [p[0], p[1]]; });
-    const trailChanged =
-      trail.length !== lastPayloadTrailLen ||
-      uiNow - lastPayloadTrailT >= PAYLOAD_TRAIL_MIN_MS;
-    if (doUi) lastPayloadUiT = uiNow;
-    if (trailChanged) {
-      lastPayloadTrailT = uiNow;
-      lastPayloadTrailLen = trail.length;
-      updateTrail(trail);
-    }
+    updateTrail(trail);
     data.traffic = stabilizeTrafficList(
       data.traffic || [],
       lat,
@@ -7298,20 +7001,20 @@
     }
     lastTelemetry = data;
     updateMapAircraftMarker();
-    if (doUi) {
-      updateTcassSuppressMapOverlay(data);
-      redrawNd();
-      redrawAdiVnavProfile();
-      updateCollisionWarnings(data);
-      updateTraffic(data.traffic);
-      syncNdToolbarChrome();
-      planHudLine(lat, lon);
-      let statusTitle =
-        "<strong>已连接</strong> · " + fmtNum(lat, 5) + "°, " + fmtNum(lon, 5) + "°";
-      if (isUserOnGround(data)) statusTitle += " · 地面";
-      else if (isTcasSuppressZone(data)) statusTitle += " · TCAS 关";
-      setStatus(true, statusTitle, "");
-    }
+    updateTcassSuppressMapOverlay(data);
+    redrawNd();
+    redrawAdiVnavProfile();
+    updateCollisionWarnings(data);
+    updateTraffic(data.traffic);
+    syncNdToolbarChrome();
+
+    planHudLine(lat, lon);
+
+    let statusTitle =
+      "<strong>已连接</strong> · " + fmtNum(lat, 5) + "°, " + fmtNum(lon, 5) + "°";
+    if (isUserOnGround(data)) statusTitle += " · 地面";
+    else if (isTcasSuppressZone(data)) statusTitle += " · TCAS 关";
+    setStatus(true, statusTitle, "");
   }
 
   function connectStream() {
@@ -7327,15 +7030,7 @@
     };
     es.onmessage = function (ev) {
       try {
-        const data = JSON.parse(ev.data);
-        applyPayload(data);
-        if (data && !data.ok && data.error) {
-          setStatus(
-            false,
-            data.error,
-            "请确认微软模拟飞行已运行并进入驾驶舱，然后重启 msfs_bridge.py。"
-          );
-        }
+        applyPayload(JSON.parse(ev.data));
       } catch (e) {
         setStatus(false, "JSON 解析失败", String(e));
       }
