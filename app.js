@@ -1392,18 +1392,6 @@
   const SMOOTH_TAU_MAIN_MS = 245;
   const SMOOTH_K_MAIN_CAP = 0.34;
   let tapeDispReady = false;
-  /** PFD 上下向显示缓动：遥测仍直连，仅俯仰/空速带/高度带 rAF 插值 */
-  let pfdTgtPitch = 0,
-    pfdTgtBank = 0,
-    pfdTgtIas,
-    pfdTgtAlt;
-  let pfdDispPitch = 0,
-    pfdDispIas,
-    pfdDispAlt;
-  let pfdAnimReady = false;
-  let pfdAnimLastT = 0;
-  const PFD_ANIM_TAU_MS = 150;
-  const PFD_ANIM_K_CAP = 0.42;
   /** 遥测包仅作观测；积分外推 + 残差分帧消化（包到达不瞬时硬拉） */
   const MOTION_MAX_STEP_MS = 100;
   const OBS_VEL_BLEND = 0.52;
@@ -1427,16 +1415,40 @@
   const RESID_STEP_MAX_IAS_KT = 0.08;
   const RESID_STEP_MAX_GS_KT = 0.08;
   const RESID_STEP_MAX_VS_FPM = 2.5;
-  const RESID_STEP_MAX_PITCH_DEG = 0.32;
-  const RESID_STEP_MAX_BANK_DEG = 0.38;
-  const OBS_PKT_DT_MIN_MS = 16;
+  const RESID_STEP_MAX_PITCH_DEG = 0.14;
+  const RESID_STEP_MAX_BANK_DEG = 0.16;
+  const OBS_PKT_DT_MIN_MS = 5;
   const OBS_PKT_DT_MAX_MS = 8000;
   /** 换机位/传送：位置突变则硬重置运动状态，避免积分把仪表甩飞 */
   const MOTION_RESET_JUMP_NM = 1.8;
+  /** PFD 姿态：遥测锚点 + 低通角速度外推，双层帧间阻尼 */
+  const PFD_ATT_PREDICT_LEAD_MS = 55;
+  const PFD_ATT_MAX_PREDICT_MS = 260;
+  const PFD_ATT_TARGET_RATE = 16;
+  const PFD_ATT_SMOOTH_RATE = 19;
+  const PFD_ATT_SNAP_GAP_MS = 1200;
+  const PFD_ATT_RATE_MAX_PITCH = 24;
+  const PFD_ATT_RATE_MAX_BANK = 36;
+  const OBS_ATT_VEL_BLEND = 0.26;
+  const CORRECT_PKT_KEEP_ATT = 0.09;
+  const RESID_TAU_ATT_S = 0.24;
+  const VNAV_DRAW_INTERVAL = 120;
+  const PFD_TERRAIN_INTERVAL = 150;
+  const PFD_RUNWAY_INTERVAL = 100;
   let motion = null;
   let motionResidual = null;
   let lastObs = null;
   let lastSmoothT = 0;
+  let pfdAttDraw = null;
+  let pfdAttTarget = null;
+  let pfdAttLastFrameT = performance.now();
+  let pfdSmoothPitchDps = 0;
+  let pfdSmoothBankDps = 0;
+  let lastSpeedTapeValue = null;
+  let lastAltTapeValue = null;
+  let lastVnavDrawT = 0;
+  let lastPfdTerrainT = 0;
+  let lastPfdRunwayT = 0;
 
   function queueCorrection(prev, fresh, keep, merge) {
     if (!Number.isFinite(fresh)) return prev;
@@ -1463,6 +1475,101 @@
     while (d > 180) d -= 360;
     while (d < -180) d += 360;
     return d;
+  }
+
+  function clampNum(v, lo, hi) {
+    if (!Number.isFinite(v)) return lo;
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function lerp(a, b, k) {
+    if (!Number.isFinite(a)) return b;
+    if (!Number.isFinite(b)) return a;
+    return a + (b - a) * k;
+  }
+
+  function lerpAngle(a, b, k) {
+    if (!Number.isFinite(a)) return b;
+    if (!Number.isFinite(b)) return a;
+    return normHdg(a + deltaAngleDeg(a, b) * k);
+  }
+
+  function smoothStep(cur, target, dt, rate) {
+    const k = 1 - Math.exp(-rate * dt);
+    return lerp(cur, target, k);
+  }
+
+  function smoothStepAngle(cur, target, dt, rate) {
+    const k = 1 - Math.exp(-rate * dt);
+    return lerpAngle(cur, target, k);
+  }
+
+  function smoothStepBank(cur, target, dt, rate) {
+    const k = 1 - Math.exp(-rate * dt);
+    if (!Number.isFinite(cur)) return target;
+    if (!Number.isFinite(target)) return cur;
+    return cur + deltaAngleDeg(cur, target) * k;
+  }
+
+  function resetPfdAttDraw() {
+    pfdAttDraw = null;
+    pfdAttTarget = null;
+    pfdAttLastFrameT = performance.now();
+    pfdSmoothPitchDps = 0;
+    pfdSmoothBankDps = 0;
+    lastSpeedTapeValue = null;
+    lastAltTapeValue = null;
+    lastVnavDrawT = 0;
+    lastPfdTerrainT = 0;
+    lastPfdRunwayT = 0;
+  }
+
+  /** 俯仰/横滚：遥测锚 + 低通角速度外推 + 双层帧间阻尼（两轴同算法） */
+  function getPredictedPfdPitch(now) {
+    let pitch = tgtPitch != null && Number.isFinite(tgtPitch) ? tgtPitch : 0;
+    if (lastObs && lastObs.t) {
+      const ageMs = now - lastObs.t;
+      const predictMs = clampNum(ageMs + PFD_ATT_PREDICT_LEAD_MS, 0, PFD_ATT_MAX_PREDICT_MS);
+      pitch += pfdSmoothPitchDps * (predictMs / 1000);
+      pitch = clampNum(pitch, -85, 85);
+    }
+    return pitch;
+  }
+
+  function getPredictedPfdBank(now) {
+    let bank = tgtBank != null && Number.isFinite(tgtBank) ? tgtBank : 0;
+    if (lastObs && lastObs.t) {
+      const ageMs = now - lastObs.t;
+      const predictMs = clampNum(ageMs + PFD_ATT_PREDICT_LEAD_MS, 0, PFD_ATT_MAX_PREDICT_MS);
+      bank += pfdSmoothBankDps * (predictMs / 1000);
+    }
+    return bank;
+  }
+
+  function updatePfdAttitudeDraw(now) {
+    const dt = clampNum((now - pfdAttLastFrameT) / 1000, 0.001, 0.05);
+    pfdAttLastFrameT = now;
+    const rawPitch = getPredictedPfdPitch(now);
+    const rawBank = getPredictedPfdBank(now);
+
+    if (!pfdAttDraw) {
+      pfdAttTarget = { pitch: rawPitch, bank: rawBank };
+      pfdAttDraw = { pitch: rawPitch, bank: rawBank };
+      return pfdAttDraw;
+    }
+    const dataGap = lastObs && lastObs.t ? now - lastObs.t : 9999;
+    if (dataGap > PFD_ATT_SNAP_GAP_MS) {
+      pfdAttTarget.pitch = rawPitch;
+      pfdAttTarget.bank = rawBank;
+      pfdAttDraw.pitch = rawPitch;
+      pfdAttDraw.bank = rawBank;
+      return pfdAttDraw;
+    }
+    pfdAttTarget.pitch = smoothStep(pfdAttTarget.pitch, rawPitch, dt, PFD_ATT_TARGET_RATE);
+    pfdAttTarget.bank = smoothStepBank(pfdAttTarget.bank, rawBank, dt, PFD_ATT_TARGET_RATE);
+    pfdAttDraw.pitch = smoothStep(pfdAttDraw.pitch, pfdAttTarget.pitch, dt, PFD_ATT_SMOOTH_RATE);
+    pfdAttDraw.bank = smoothStepBank(pfdAttDraw.bank, pfdAttTarget.bank, dt, PFD_ATT_SMOOTH_RATE);
+    return pfdAttDraw;
   }
 
   function telemetryToAnchor(data) {
@@ -1577,8 +1684,16 @@
     const dtMin = dtMs / 60000;
     const out = {
       hdgDps: deltaAngleDeg(a.hdg, b.hdg) / dtS,
-      pitchDps: ((b.pitch || 0) - (a.pitch || 0)) / dtS,
-      bankDps: deltaAngleDeg(a.bank, b.bank) / dtS,
+      pitchDps: clampNum(
+        ((b.pitch || 0) - (a.pitch || 0)) / dtS,
+        -PFD_ATT_RATE_MAX_PITCH,
+        PFD_ATT_RATE_MAX_PITCH
+      ),
+      bankDps: clampNum(
+        deltaAngleDeg(a.bank, b.bank) / dtS,
+        -PFD_ATT_RATE_MAX_BANK,
+        PFD_ATT_RATE_MAX_BANK
+      ),
       iasKtPerS: 0,
       gsKtPerS: 0,
       vsFpm: null,
@@ -1712,13 +1827,13 @@
       r.pitch,
       (z.pitch != null && Number.isFinite(z.pitch) ? z.pitch : 0) -
         (m.pitch != null && Number.isFinite(m.pitch) ? m.pitch : 0),
-      CORRECT_PKT_KEEP,
+      CORRECT_PKT_KEEP_ATT,
       CORRECT_RESID_MERGE
     );
     r.bank = queueCorrection(
       r.bank,
       deltaAngleDeg(m.bank, z.bank),
-      CORRECT_PKT_KEEP,
+      CORRECT_PKT_KEEP_ATT,
       CORRECT_RESID_MERGE
     );
     const freshIas =
@@ -1758,6 +1873,7 @@
     const kPos = 1 - Math.exp(-dtS / RESID_TAU_POS_S);
     const kHdg = 1 - Math.exp(-dtS / RESID_TAU_HDG_S);
     const kSc = 1 - Math.exp(-dtS / RESID_TAU_SCALAR_S);
+    const kAtt = 1 - Math.exp(-dtS / RESID_TAU_ATT_S);
 
     const bl = bleedResidualStep(r.lat, kPos, RESID_STEP_MAX_LAT);
     m.lat += bl.step;
@@ -1777,12 +1893,12 @@
     r.hdg = bh.left;
 
     if (m.pitch != null && Number.isFinite(m.pitch)) {
-      const bp = bleedResidualStep(r.pitch, kSc, RESID_STEP_MAX_PITCH_DEG);
+      const bp = bleedResidualStep(r.pitch, kAtt, RESID_STEP_MAX_PITCH_DEG);
       m.pitch += bp.step;
       r.pitch = bp.left;
     }
     if (m.bank != null && Number.isFinite(m.bank)) {
-      const bb = bleedResidualStep(r.bank, kSc, RESID_STEP_MAX_BANK_DEG);
+      const bb = bleedResidualStep(r.bank, kAtt, RESID_STEP_MAX_BANK_DEG);
       m.bank += bb.step;
       r.bank = bb.left;
     }
@@ -1841,6 +1957,7 @@
     motionResidual = null;
     lastObs = null;
     dispTrkShow = null;
+    resetPfdAttDraw();
   }
 
   function observationNeedsMotionReset(prevZ, z) {
@@ -1884,8 +2001,21 @@
     }
 
     if (dtMs >= OBS_PKT_DT_MIN_MS && dtMs <= OBS_PKT_DT_MAX_MS) {
-      blendMotionVelocities(motion, measureVelocitiesFromObs(lastObs.z, z, dtMs), OBS_VEL_BLEND);
-    } else {
+      const v = measureVelocitiesFromObs(lastObs.z, z, dtMs);
+      blendMotionVelocities(motion, v, OBS_VEL_BLEND);
+      pfdSmoothPitchDps += (v.pitchDps - pfdSmoothPitchDps) * OBS_ATT_VEL_BLEND;
+      pfdSmoothBankDps += (v.bankDps - pfdSmoothBankDps) * OBS_ATT_VEL_BLEND;
+      pfdSmoothPitchDps = clampNum(
+        pfdSmoothPitchDps,
+        -PFD_ATT_RATE_MAX_PITCH,
+        PFD_ATT_RATE_MAX_PITCH
+      );
+      pfdSmoothBankDps = clampNum(
+        pfdSmoothBankDps,
+        -PFD_ATT_RATE_MAX_BANK,
+        PFD_ATT_RATE_MAX_BANK
+      );
+    } else if (dtMs > OBS_PKT_DT_MAX_MS) {
       motion.pitch = z.pitch;
       motion.bank = z.bank;
       motion.pitchDps = 0;
@@ -1897,6 +2027,7 @@
           motion.vs = z.vs;
         }
       }
+      resetPfdAttDraw();
     }
     blendMotionAuxFromObs(motion, z, OBS_AUX_BLEND);
     const trkObs = trkObsFromAnchor(z, z.gs);
@@ -1930,8 +2061,6 @@
     integrateMotionStep(motion, dtS);
     bleedMotionResidual(motion, dtS);
     applyMotionToDisp(motion);
-    dispPitch = motion.pitch;
-    dispBank = motion.bank;
     const trkUiObs =
       tgtTrack != null && Number.isFinite(tgtTrack)
         ? tgtTrack
@@ -1972,41 +2101,55 @@
     ) {
       dispAglBaroUse = dispAlt - dispGroundElevFt;
     }
-    updateAttitude(dispPitch, dispBank);
-    updateSpeedTape(dispIas);
-    updateAltTape(dispAlt);
+    const att = updatePfdAttitudeDraw(t);
+    const attPitch = att ? att.pitch : motion.pitch;
+    const attBank = att ? att.bank : motion.bank;
+    dispPitch = attPitch;
+    dispBank = attBank;
+    updateAttitude(attPitch, attBank);
+    updateSpeedTapeSmart(dispIas);
+    updateAltTapeSmart(dispAlt);
     updateAdiHud(
       dispIas,
       dispAlt,
       dispVs,
       dispHdg,
-      dispBank,
+      attBank,
       dispGroundElevFt,
       dispRadioHeightFt,
       dispAglBaroUse,
       dispAglGameFt
     );
-    updateAdiTerrain(
-      dispRadioHeightFt,
-      dispAglBaroUse,
-      dispAglGameFt,
-      dispAlt,
-      dispGroundElevFt,
-      dispLat,
-      dispLon
-    );
+    if (t - lastPfdTerrainT >= PFD_TERRAIN_INTERVAL) {
+      lastPfdTerrainT = t;
+      updateAdiTerrain(
+        dispRadioHeightFt,
+        dispAglBaroUse,
+        dispAglGameFt,
+        dispAlt,
+        dispGroundElevFt,
+        dispLat,
+        dispLon
+      );
+    }
     const navRw = navAcState();
-    updateAdiRunwayOverlay(
-      lastTelemetry,
-      dispPitch,
-      dispBank,
-      dispAlt,
-      navRw ? navRw.hdg : dispHdg,
-      navRw ? navRw.lat : dispLat,
-      navRw ? navRw.lon : dispLon
-    );
+    if (t - lastPfdRunwayT >= PFD_RUNWAY_INTERVAL) {
+      lastPfdRunwayT = t;
+      updateAdiRunwayOverlay(
+        lastTelemetry,
+        attPitch,
+        attBank,
+        dispAlt,
+        navRw ? navRw.hdg : dispHdg,
+        navRw ? navRw.lat : dispLat,
+        navRw ? navRw.lon : dispLon
+      );
+    }
     updatePfdNdToolbarStats(lastTelemetry);
-    redrawAdiVnavProfile();
+    if (t - lastVnavDrawT >= VNAV_DRAW_INTERVAL) {
+      lastVnavDrawT = t;
+      redrawAdiVnavProfile();
+    }
   }
 
   function buildPitchLadder() {
@@ -2180,6 +2323,34 @@
     }
   }
 
+  function updateSpeedTapeSmart(ias) {
+    if (ias == null || !Number.isFinite(ias)) {
+      if (lastSpeedTapeValue !== null) {
+        lastSpeedTapeValue = null;
+        updateSpeedTape(null);
+      }
+      return;
+    }
+    const v = Math.round(ias * 2) / 2;
+    if (v === lastSpeedTapeValue) return;
+    lastSpeedTapeValue = v;
+    updateSpeedTape(ias);
+  }
+
+  function updateAltTapeSmart(altFt) {
+    if (altFt == null || !Number.isFinite(altFt)) {
+      if (lastAltTapeValue !== null) {
+        lastAltTapeValue = null;
+        updateAltTape(null);
+      }
+      return;
+    }
+    const v = Math.round(altFt / 10);
+    if (v === lastAltTapeValue) return;
+    lastAltTapeValue = v;
+    updateAltTape(altFt);
+  }
+
   function updateSpeedTape(ias) {
     const inner = document.getElementById("speedTapeInner");
     const bug = document.getElementById("speedBug");
@@ -2269,8 +2440,9 @@
     const p = pitch != null && Number.isFinite(pitch) ? pitch : 0;
     const b = bank != null && Number.isFinite(bank) ? bank : 0;
     /* 俯仰与 SimConnect 符号相反需取反平移；横滚左右与 CSS 约定一致用正值=顺时针坡度 */
-    bEl.style.transform = "translateZ(0) rotate(" + b + "deg)";
-    pEl.style.transform = "translateZ(0) translateY(" + -p * PITCH_PX_PER_DEG + "px)";
+    bEl.style.transform = "translateZ(0) rotate(" + b.toFixed(2) + "deg)";
+    pEl.style.transform =
+      "translateZ(0) translateY(" + (-p * PITCH_PX_PER_DEG).toFixed(2) + "px)";
   }
 
   /** 地形/AGL：低空优先无线电，否则用模拟器几何 AGL（与游戏一致），再退回气压近似 */
@@ -2594,69 +2766,20 @@
     g.innerHTML = html;
   }
 
-  function resetPfdVerticalAnim() {
-    pfdAnimReady = false;
-    pfdAnimLastT = 0;
-    pfdDispPitch = 0;
-    pfdDispIas = null;
-    pfdDispAlt = null;
-  }
-
-  function syncPfdVerticalAnimTargets(data) {
-    pfdTgtPitch = data.pitch_deg != null && Number.isFinite(data.pitch_deg) ? data.pitch_deg : 0;
-    pfdTgtBank = data.bank_deg != null && Number.isFinite(data.bank_deg) ? data.bank_deg : 0;
-    pfdTgtIas = data.ias_knots;
-    pfdTgtAlt = data.alt_ft;
-    if (!pfdAnimReady) {
-      pfdDispPitch = pfdTgtPitch;
-      pfdDispIas = pfdTgtIas;
-      pfdDispAlt = pfdTgtAlt;
-      pfdAnimReady = true;
-      updateAttitude(pfdDispPitch, pfdTgtBank);
-      updateSpeedTape(pfdDispIas);
-      updateAltTape(pfdDispAlt);
-    }
-  }
-
-  function tickPfdVerticalAnim(now) {
-    requestAnimationFrame(tickPfdVerticalAnim);
-    if (!pfdAnimReady || !lastTelemetry || !lastTelemetry.ok) {
-      pfdAnimLastT = 0;
-      return;
-    }
-    const t = typeof now === "number" ? now : performance.now();
-    const dtMs =
-      pfdAnimLastT <= 0 ? 1000 / 60 : Math.min(48, Math.max(0, t - pfdAnimLastT));
-    pfdAnimLastT = t;
-    const k = Math.min(PFD_ANIM_K_CAP, 1 - Math.exp(-dtMs / PFD_ANIM_TAU_MS));
-    function step(cur, tgt) {
-      if (tgt == null || !Number.isFinite(tgt)) return cur;
-      const d0 = cur != null && Number.isFinite(cur) ? cur : tgt;
-      return d0 + (tgt - d0) * k;
-    }
-    pfdDispPitch = step(pfdDispPitch, pfdTgtPitch);
-    pfdDispIas = step(pfdDispIas, pfdTgtIas);
-    pfdDispAlt = step(pfdDispAlt, pfdTgtAlt);
-    updateAttitude(pfdDispPitch, pfdTgtBank);
-    updateSpeedTape(pfdDispIas);
-    updateAltTape(pfdDispAlt);
-  }
-
-  /** PFD：SimConnect 仪表 SimVar（INDICATED ALTITUDE / HEADING INDICATOR 等，与 G1000/G3000 同源）；Events 仅用于按键 */
   function updatePfdInstruments(data) {
     if (!data || !data.ok) {
-      resetPfdVerticalAnim();
       updateSpeedTape(null);
       updateAltTape(null);
       updateAttitude(0, 0);
       updateAdiHud(null, null, null, null, null, null, null, null, null);
       updateAdiTerrain(null, null, null, null, null, null, null);
       updateAdiRunwayOverlay(null, 0, 0, null, null);
-      updatePfdNdToolbarStats(null);
       redrawAdiVnavProfile();
       return;
     }
-    syncPfdVerticalAnimTargets(data);
+    updateSpeedTape(data.ias_knots);
+    updateAltTape(data.alt_ft);
+    updateAttitude(data.pitch_deg, data.bank_deg);
     updateAdiHud(
       data.ias_knots,
       data.alt_ft,
@@ -2677,17 +2800,6 @@
       data.lat,
       data.lon
     );
-    updateAdiRunwayOverlay(
-      data,
-      data.pitch_deg,
-      data.bank_deg,
-      data.alt_ft,
-      data.heading_deg,
-      data.lat,
-      data.lon
-    );
-    updatePfdNdToolbarStats(data);
-    redrawAdiVnavProfile();
   }
 
   function fmtNum(n, d) {
@@ -5812,16 +5924,20 @@
     const acEl = document.getElementById("ndStatAc");
     const t = tel && tel.ok ? tel : lastTelemetry && lastTelemetry.ok ? lastTelemetry : null;
     const gs =
-      t && t.groundspeed_knots != null && Number.isFinite(t.groundspeed_knots)
-        ? t.groundspeed_knots
-        : null;
+      smoothReady && dispGs != null && Number.isFinite(dispGs)
+        ? dispGs
+        : t && t.groundspeed_knots != null && Number.isFinite(t.groundspeed_knots)
+          ? t.groundspeed_knots
+          : null;
     if (gsEl) gsEl.textContent = fmtNum(gs, 0);
     if (tasEl) {
       const tas = t ? tasKnotsFromTelemetry(t) : null;
       tasEl.textContent = tas != null ? String(tas) : "—";
     }
     let trk = null;
-    if (t) {
+    if (dispTrkShow != null && Number.isFinite(dispTrkShow)) trk = normHdg(dispTrkShow);
+    else if (smoothReady && dispTrack != null && Number.isFinite(dispTrack)) trk = normHdg(dispTrack);
+    else if (t) {
       if (t.ground_track_deg != null && Number.isFinite(t.ground_track_deg)) trk = normHdg(t.ground_track_deg);
       else if (t.heading_deg != null && Number.isFinite(t.heading_deg)) trk = normHdg(t.heading_deg);
     }
@@ -7142,7 +7258,7 @@
     const hdg = data.heading_deg;
     const ll = [lat, wrapLng180(lon)];
 
-    syncTgtFromAnchor(telemetryToAnchor(data));
+    ingestMotionObservation(data, performance.now());
 
     if (!marker) {
       marker = L.marker(L.latLng(ll[0], ll[1]), { icon: planeIcon }).addTo(map);
@@ -7182,7 +7298,6 @@
     }
     lastTelemetry = data;
     updateMapAircraftMarker();
-    updatePfdInstruments(data);
     if (doUi) {
       updateTcassSuppressMapOverlay(data);
       redrawNd();
@@ -7718,5 +7833,5 @@
     scheduleMapLayoutRefresh(false);
     connectStream();
   });
-  requestAnimationFrame(tickPfdVerticalAnim);
+  requestAnimationFrame(tickSmooth);
 })();
