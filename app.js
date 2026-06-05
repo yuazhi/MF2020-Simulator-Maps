@@ -2,6 +2,7 @@
   const STREAM_URL = "/api/stream";
   const PLAN_SYNC_URL = "/api/plan";
   const PLAN_LOAD_MSFS_URL = "/api/plan/load-msfs";
+  const AIRPORT_GND_URL = "/api/airport-gnd";
   const PLAN_STORAGE_KEY = "msfs_imported_plan_v1";
   const AUTO_LOAD_MSFS_KEY = "msfs_auto_load_msfs_v1";
   const BASE_LAYER_STORAGE_KEY = "msfs_base_layer_v1";
@@ -199,20 +200,112 @@
     });
   }
 
+  function isPhoneAdapt() {
+    const h = document.documentElement;
+    return h.classList.contains("mobile-adapt") && !h.classList.contains("tablet-adapt");
+  }
+
+  function pfdPanelScaleFactor(panel) {
+    if (!panel) return 1;
+    const ds = panel.dataset.pfdScale;
+    if (ds) {
+      const v = parseFloat(ds);
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+    const zoom = parseFloat(panel.style.zoom);
+    if (Number.isFinite(zoom) && zoom > 0 && zoom < 0.995) return zoom;
+    const tr = panel.style.transform || "";
+    const m = tr.match(/scale\(([\d.]+)\)/);
+    if (m) {
+      const s = parseFloat(m[1]);
+      if (Number.isFinite(s) && s > 0) return s;
+    }
+    return 1;
+  }
+
+  /** 面板遮挡占地图高度比例 [0, 0.88] */
+  function mapFollowObstructionRatio(panelTopMapY, mapHeight) {
+    if (!mapHeight || mapHeight <= 0) return 0;
+    return Math.max(0, Math.min(0.88, panelTopMapY / mapHeight));
+  }
+
+  /**
+   * 展开 PFD 时可见区内的纵向对准比例（0=顶，1=底）。
+   * 手机 / 电脑 / Mac 按视口与遮挡比例分别自适应。
+   */
+  function mapFollowAimFracExpanded(visibleH, size) {
+    const r = mapFollowObstructionRatio(visibleH, size.y);
+    if (isPhoneAdapt()) {
+      return Math.max(0.36, Math.min(0.5, 0.5 - r * 0.16));
+    }
+    const vh = size.y;
+    const vw = size.x;
+    const heightBias =
+      vh >= 960 ? 0.018 :
+      vh >= 820 ? 0.022 :
+      vh >= 680 ? 0.026 :
+      0.03;
+    const widthBias = Math.max(0, Math.min(0.012, ((vw - 720) / 800) * 0.012));
+    const aimFrac = 0.5 + r * 0.085 + heightBias + widthBias;
+    return Math.max(0.51, Math.min(0.58, aimFrac));
+  }
+
+  /** PFD 顶边（client）：手机端按缩放与布局自动估算遮挡 */
+  function pfdObstructionTopClient(panel, panelRect) {
+    let top = panelRect.top;
+    if (!panel || panel.classList.contains("is-collapsed")) return top;
+    if (!isPhoneAdapt()) return top;
+    const layoutH = panel.offsetHeight;
+    if (!(layoutH > 0)) return top;
+    const sf = pfdPanelScaleFactor(panel);
+    const scaledTop = panelRect.bottom - layoutH * sf;
+    if (Number.isFinite(scaledTop)) top = Math.min(top, scaledTop);
+    if (sf < 0.995) {
+      const layoutTop = panelRect.bottom - layoutH;
+      const shrink = Math.max(0, Math.min(1, 1 - sf));
+      top = top + (Math.min(top, layoutTop) - top) * shrink * 0.45;
+    }
+    const head = panel.querySelector(".pfd-panel-head");
+    if (head) {
+      const ht = head.getBoundingClientRect().top;
+      if (Number.isFinite(ht)) top = Math.min(top, ht);
+    }
+    return top;
+  }
+
   /** 机标应对准的容器像素点（与 map.getSize / project 同一坐标系） */
   function mapFollowAimPointPx() {
     const size = map.getSize();
     if (!size.x || !size.y) return L.point(0, 0);
-    const panel = document.getElementById("pfdPanel");
-    if (!panel) return L.point(size.x / 2, size.y / 2);
     const mapEl = map.getContainer();
     const mapRect = mapEl.getBoundingClientRect();
+    if (!mapRect.width || !mapRect.height) {
+      return L.point(size.x / 2, size.y / 2);
+    }
+    const scaleY = size.y / mapRect.height;
+    const panel = document.getElementById("pfdPanel");
+    if (!panel) return L.point(size.x / 2, size.y / 2);
     const panelRect = panel.getBoundingClientRect();
-    let overlap = mapRect.bottom - panelRect.top;
-    if (!Number.isFinite(overlap) || overlap < 0) overlap = 0;
-    if (overlap > size.y * 0.9) overlap = size.y * 0.9;
-    const visibleH = Math.max(40, size.y - overlap);
-    return L.point(size.x / 2, visibleH * 0.5);
+    const topClient = pfdObstructionTopClient(panel, panelRect);
+    let panelTopMapY = (topClient - mapRect.top) * scaleY;
+    if (!Number.isFinite(panelTopMapY)) panelTopMapY = size.y;
+    panelTopMapY = Math.max(0, Math.min(size.y, panelTopMapY));
+    const visibleH = Math.max(48, panelTopMapY);
+    const expanded = !panel.classList.contains("is-collapsed");
+    const aimFrac = expanded ? mapFollowAimFracExpanded(visibleH, size) : 0.5;
+    return L.point(size.x / 2, visibleH * aimFrac);
+  }
+
+  let pfdLayoutFollowT = 0;
+  /** PFD 折叠/展开动画结束后再对准，避免展开后仍用收起时的高度居中 */
+  function scheduleMapFollowAfterPfdLayout() {
+    scheduleMapLayoutRefresh(followPlane);
+    if (!followPlane) return;
+    if (pfdLayoutFollowT) clearTimeout(pfdLayoutFollowT);
+    pfdLayoutFollowT = setTimeout(function () {
+      pfdLayoutFollowT = 0;
+      scheduleMapLayoutRefresh(true);
+    }, 480);
   }
 
   /** 地图/航迹：始终用最新遥测包坐标，不走运动预测 */
@@ -248,6 +341,10 @@
 
   let mapLayoutRefreshT = null;
   function scheduleMapLayoutRefresh(refollow) {
+    if (refollow && followPlane) {
+      map.invalidateSize({ animate: false, pan: false });
+      refollowMapCenter();
+    }
     if (mapLayoutRefreshT) clearTimeout(mapLayoutRefreshT);
     mapLayoutRefreshT = setTimeout(function () {
       mapLayoutRefreshT = null;
@@ -265,7 +362,38 @@
     }, 160);
   }
 
+  function mapFollowTargetLatLng(now) {
+    if (!marker) return null;
+    const ll = marker.getLatLng();
+    if (!ll || !Number.isFinite(ll.lat) || !Number.isFinite(ll.lng)) return null;
+    const tel = lastTelemetry;
+    if (!tel || !tel.ok || lastMapObsT <= 0) return ll;
+    const gs = tel.groundspeed_knots;
+    const trk =
+      tel.ground_track_deg != null && Number.isFinite(tel.ground_track_deg)
+        ? tel.ground_track_deg
+        : tel.heading_deg != null && Number.isFinite(tel.heading_deg)
+          ? tel.heading_deg
+          : null;
+    if (gs == null || !Number.isFinite(gs) || gs < 0.4 || trk == null || !Number.isFinite(trk)) {
+      return ll;
+    }
+    const t = typeof now === "number" ? now : performance.now();
+    const dtS = Math.min(MAP_FOLLOW_EXTRAP_MAX_S, Math.max(0, (t - lastMapObsT) / 1000));
+    if (dtS <= 0) return ll;
+    const vel = velEnuNmPerMin(gs, trk);
+    const northNm = vel.north * (dtS / 60);
+    const eastNm = vel.east * (dtS / 60);
+    const cosLat = Math.cos((ll.lat * Math.PI) / 180);
+    return L.latLng(
+      ll.lat + northNm / 60,
+      wrapLng180(ll.lng + (Math.abs(cosLat) > 1e-6 ? eastNm / (60 * cosLat) : 0))
+    );
+  }
+
   function mapFollowPlaneLatLng() {
+    const ll = mapFollowTargetLatLng(performance.now());
+    if (ll) return ll;
     const ac = mapAcState();
     if (
       ac &&
@@ -276,7 +404,7 @@
     ) {
       return L.latLng(ac.lat, ac.lon);
     }
-    return marker ? marker.getLatLng() : null;
+    return null;
   }
 
   /** 给定缩放级别，使机标落在可见区中心（避开底部 PFD）时的地图中心经纬度 */
@@ -304,6 +432,56 @@
   function refollowMapCenter() {
     if (!followPlane) return;
     setMapFollowView(null);
+  }
+
+  /** 用户主动重新跟随：硬对准 */
+  function snapMapFollowToPlane() {
+    lastMapFollowT = performance.now();
+    if (followPlane) setMapFollowView(null);
+  }
+
+  function syncFollowPlaneChrome() {
+    if (!btnFollow) return;
+    btnFollow.classList.toggle("is-active", followPlane);
+    btnFollow.setAttribute("aria-pressed", followPlane ? "true" : "false");
+    btnFollow.title = followPlane ? "已锁定跟随 · 点击解锁" : "跟随飞机 · 点击锁定";
+  }
+
+  /** 地图跟随：机标 + 包间外推，仅指数 pan（无瞬时补偿、无独立积分轨） */
+  const MAP_FOLLOW_TAU_MS = 175;
+  const MAP_FOLLOW_K_MAX = 0.42;
+  const MAP_FOLLOW_EXTRAP_MAX_S = 2.2;
+  let lastMapFollowT = 0;
+  let lastMapObsT = 0;
+
+  function tickMapFollowSmooth(dtMs, lat, lon) {
+    const ll = L.latLng(lat, lon);
+    const aim = mapFollowAimPointPx();
+    const pt = map.latLngToContainerPoint(ll);
+    if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
+    const dx = aim.x - pt.x;
+    const dy = aim.y - pt.y;
+    const err2 = dx * dx + dy * dy;
+    if (err2 < 1e-4) return;
+    const k = Math.min(MAP_FOLLOW_K_MAX, 1 - Math.exp(-dtMs / MAP_FOLLOW_TAU_MS));
+    map.panBy(L.point(-dx * k, -dy * k), { animate: false, noMoveStart: true });
+  }
+
+  function tickMapFollowFromPlane(now) {
+    const t = typeof now === "number" ? now : performance.now();
+    if (followPlane) {
+      const dtMs =
+        lastMapFollowT <= 0 ? 1000 / 60 : Math.min(100, Math.max(0, t - lastMapFollowT));
+      lastMapFollowT = t;
+      const ll = mapFollowTargetLatLng(t);
+      if (ll) tickMapFollowSmooth(dtMs, ll.lat, ll.lng);
+    }
+    maybeRefreshNavCnDuringFollow(t);
+  }
+
+  function tickMapFollow(now) {
+    requestAnimationFrame(tickMapFollow);
+    tickMapFollowFromPlane(typeof now === "number" ? now : performance.now());
   }
 
   /** 地图以飞机为中心：机标对准可见区域几何中心（避开底部 PFD 遮挡） */
@@ -383,15 +561,87 @@
     });
   }
 
+  const PLANE_ICON_W = 24;
+  const PLANE_ICON_H = 28;
+  const PLANE_ICON_NOSE_Y = 2;
+  /** 地图锚点/旋转枢轴在机尾：GPS 绿线接尾，机头 Leading 于航迹 */
+  const PLANE_ICON_TAIL_Y = 23;
+  const PLANE_ICON_REF_ZOOM = 10;
+  const PLANE_ICON_SCALE_MIN = 0.48;
+  const PLANE_ICON_SCALE_MAX = 1;
+  const TRAIL_END_TRIM_NM_MIN = 0.0045;
+  const TRAIL_END_TRIM_NM_MAX = 0.0095;
+
+  function planeIconScaleForZoom(z) {
+    const zUse = z != null && Number.isFinite(z) ? z : map.getZoom();
+    const s = Math.pow(0.875, PLANE_ICON_REF_ZOOM - zUse);
+    return Math.min(PLANE_ICON_SCALE_MAX, Math.max(PLANE_ICON_SCALE_MIN, s));
+  }
+
+  /** 地图缩小（zoom 降低）时增大机尾后绿线留白 */
+  function trailZoomOutMul(z) {
+    const zUse = z != null && Number.isFinite(z) ? z : map.getZoom();
+    const dzOut = Math.max(0, PLANE_ICON_REF_ZOOM - zUse);
+    if (dzOut <= 0) return 1;
+    return 1 + dzOut * 0.38;
+  }
+
+  function trailTailClearancePx(z) {
+    const zUse = z != null && Number.isFinite(z) ? z : map.getZoom();
+    const sc = planeIconScaleForZoom(zUse);
+    const tailPx = (PLANE_ICON_H - PLANE_ICON_NOSE_Y + 10) * sc;
+    const tailRefPx = (PLANE_ICON_H - PLANE_ICON_NOSE_Y + 10) * PLANE_ICON_SCALE_MAX;
+    return Math.max(tailPx, tailRefPx) * trailZoomOutMul(zUse);
+  }
+
+  function planeIconApplyTransform(wrap, bearingDeg, zoom) {
+    if (!wrap) return;
+    const sc = planeIconScaleForZoom(zoom);
+    const brg = bearingDeg != null && Number.isFinite(bearingDeg) ? bearingDeg : 0;
+    wrap.style.transform = "rotate(" + brg + "deg) scale(" + sc + ")";
+  }
+
+  function syncPlaneMarkerBearingApply() {
+    if (!marker) return;
+    const el = marker.getElement && marker.getElement();
+    const wrap = el && el.querySelector(".plane-hdg");
+    const brg = planeMapBrgHoldReady ? planeMapBrgHold : planeMapBearingCompute(mapAcState());
+    planeIconApplyTransform(wrap, brg, map.getZoom());
+  }
+
+  /** 缩放过程中只改图标大小，不重算朝向（避免 zoom 事件连发左右抖） */
+  function refreshPlaneMarkerScaleOnly() {
+    syncPlaneMarkerBearingApply();
+  }
+
+  function refreshPlaneMarkerTransform() {
+    recomputePlaneMapBearingHold(mapAcState());
+    syncPlaneMarkerBearingApply();
+  }
+
   const planeIcon = L.divIcon({
     className: "plane-marker",
     html:
-      '<div class="plane-hdg" style="width:16px;height:24px;transform-origin:8px 12px;will-change:transform">' +
-      '<div style="position:absolute;left:50%;bottom:2px;width:0;height:0;margin-left:-8px;' +
-      "border-left:8px solid transparent;border-right:8px solid transparent;" +
-      'border-bottom:20px solid #58a6ff;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))"></div></div>',
-    iconSize: [16, 24],
-    iconAnchor: [8, 12]
+      '<div class="plane-hdg" style="width:' +
+      PLANE_ICON_W +
+      "px;height:" +
+      PLANE_ICON_H +
+      "px;transform-origin:" +
+      PLANE_ICON_W / 2 +
+      "px " +
+      PLANE_ICON_TAIL_Y +
+      'px;will-change:transform">' +
+      '<svg class="plane-hdg-sym" width="' +
+      PLANE_ICON_W +
+      '" height="' +
+      PLANE_ICON_H +
+      '" viewBox="0 0 24 28" aria-hidden="true">' +
+      '<line x1="12" y1="2" x2="12" y2="24" class="plane-hdg-line plane-hdg-fus"/>' +
+      '<line x1="1" y1="10.5" x2="23" y2="10.5" class="plane-hdg-line plane-hdg-wing"/>' +
+      '<line x1="7" y1="22" x2="17" y2="22" class="plane-hdg-line plane-hdg-tail"/>' +
+      "</svg></div>",
+    iconSize: [PLANE_ICON_W, PLANE_ICON_H],
+    iconAnchor: [PLANE_ICON_W / 2, PLANE_ICON_TAIL_Y]
   });
 
   const trafficIcon = L.divIcon({
@@ -407,6 +657,13 @@
 
   let marker = null;
   let trailLayer = null;
+  /** 与地图绿线 polyline 一致，供本机符号按 GPS 航迹方向旋转 */
+  let mapTrailLatLngs = null;
+  let lastTrailRawLatLngs = null;
+  let planeMapBrgHold = 0;
+  let planeMapBrgHoldReady = false;
+  /** 航向锁定：变化小于此角度不更新，避免机头左右抖 */
+  const PLANE_MAP_BRG_LOCK_DEG = 2.2;
   let trafficLayer = L.layerGroup().addTo(map);
   let trafficTracksLayer = L.layerGroup().addTo(map);
   const trafficTrackHistory = Object.create(null);
@@ -484,6 +741,7 @@
   const NAV_CN_STORAGE_KEY = "msfs_nav_cn_layer_v1";
   const NAV_CN_TYPES_KEY = "msfs_nav_cn_types_v1";
   const NAV_CHART_OPACITY = 0.48;
+  const NAV_CHART_APT_OPACITY = 0.30;
   const NAV_CHART_COLORS = {
     airway: {
       line: "#38bdf8",
@@ -542,7 +800,8 @@
       boxBorder: "rgba(244,114,182,0.9)",
       subText: "#64748b"
     },
-    apt: { text: "#1d4ed8" }
+    apt: { fill: "#ec4899", stroke: "#be185d", text: "#9d174d" },
+    aptDark: { fill: "#f472b6", stroke: "#db2777", text: "#fbcfe8" }
   };
 
   function isNavChartDarkBase() {
@@ -561,12 +820,20 @@
       ? NAV_CHART_COLORS.fixDark
       : NAV_CHART_COLORS.fix;
   }
+
+  function navChartAptColorSet() {
+    return isNavChartDarkBase()
+      ? NAV_CHART_COLORS.aptDark
+      : NAV_CHART_COLORS.apt;
+  }
   let navCnEnabled = true;
   let navCnShow = { fir: true, airway: true, fix: true, navaid: true, airport: true };
   let navCnData = null;
   let navCnLayer = L.layerGroup();
   let navCnRefreshTimer = 0;
   let navCnLastRefreshKey = "";
+  let navCnRefreshGen = 0;
+  let navCnFollowRefreshT = 0;
   const navIconCache = new Map();
   const NAV_ICON_CACHE_MAX = 480;
 
@@ -642,11 +909,13 @@
     map.createPane("navCnPaneAwyLbl");
     map.createPane("navCnPaneFix");
     map.createPane("navCnPaneNav");
+    map.createPane("navCnPaneApt");
     const navPaneFir = map.getPane("navCnPaneFir");
     const navPane = map.getPane("navCnPane");
     const navAwyLbl = map.getPane("navCnPaneAwyLbl");
     const navPaneFix = map.getPane("navCnPaneFix");
     const navPaneNav = map.getPane("navCnPaneNav");
+    const navPaneApt = map.getPane("navCnPaneApt");
     if (navPaneFir) {
       navPaneFir.style.zIndex = "408";
       navPaneFir.style.opacity = String(NAV_CHART_OPACITY);
@@ -669,8 +938,20 @@
       navPaneNav.style.zIndex = "413";
       navPaneNav.style.opacity = "1";
     }
+    if (navPaneApt) {
+      navPaneApt.style.zIndex = "409";
+      navPaneApt.style.opacity = String(NAV_CHART_APT_OPACITY);
+    }
   }
   navCnLayer.addTo(map);
+  const NAV_CN_PANE_IDS = [
+    "navCnPaneFir",
+    "navCnPane",
+    "navCnPaneAwyLbl",
+    "navCnPaneFix",
+    "navCnPaneNav",
+    "navCnPaneApt"
+  ];
   try {
     const savedNav = localStorage.getItem(NAV_CN_STORAGE_KEY);
     if (savedNav === "0") navCnEnabled = false;
@@ -712,20 +993,83 @@
     }
   }
 
+  function navCnRefreshOk(gen) {
+    return gen === navCnRefreshGen && navCnEnabled && !!navCnData;
+  }
+
+  function setNavCnChartVisible(visible) {
+    for (let i = 0; i < NAV_CN_PANE_IDS.length; i++) {
+      const pane = map.getPane(NAV_CN_PANE_IDS[i]);
+      if (pane) pane.style.visibility = visible ? "" : "hidden";
+    }
+    if (visible) {
+      if (!map.hasLayer(navCnLayer)) navCnLayer.addTo(map);
+    } else {
+      navCnLayer.clearLayers();
+      if (map.hasLayer(navCnLayer)) map.removeLayer(navCnLayer);
+    }
+  }
+
+  function clearNavCnChartQuiet() {
+    navCnLayer.clearLayers();
+    setNavCnChartVisible(false);
+    navCnLastRefreshKey = "";
+  }
+
+  function hideNavCnLayersNow() {
+    navCnRefreshGen++;
+    if (navCnRefreshTimer) {
+      clearTimeout(navCnRefreshTimer);
+      navCnRefreshTimer = 0;
+    }
+    clearNavCnChartQuiet();
+  }
+
+  function showNavCnChartNow() {
+    setNavCnChartVisible(true);
+  }
+
+  function applyNavCnUserEnabled(enabled) {
+    const next = !!enabled;
+    if (next === navCnEnabled) return;
+    navCnEnabled = next;
+    const chk = document.getElementById("chkNavCn");
+    if (chk) chk.checked = next;
+    try {
+      localStorage.setItem(NAV_CN_STORAGE_KEY, next ? "1" : "0");
+    } catch (eNavApply) {}
+    syncNavCnLayersUi();
+    if (!next) hideNavCnLayersNow();
+    else {
+      showNavCnChartNow();
+      scheduleNavCnRefresh(true);
+    }
+  }
+
+  function maybeRefreshNavCnDuringFollow(now) {
+    if (!followPlane || !navCnEnabled || !navCnData) return;
+    const t = typeof now === "number" ? now : performance.now();
+    if (t - navCnFollowRefreshT < 1400) return;
+    navCnFollowRefreshT = t;
+    scheduleNavCnRefresh(false);
+  }
+
   function scheduleNavCnRefresh(force) {
+    const forceRefresh = force === true;
     if (navCnRefreshTimer) clearTimeout(navCnRefreshTimer);
     navCnRefreshTimer = window.setTimeout(function () {
       navCnRefreshTimer = 0;
       if (!navCnEnabled || !navCnData) {
-        navCnLayer.clearLayers();
-        navCnLastRefreshKey = "";
+        clearNavCnChartQuiet();
         return;
       }
       const key = navCnComputeRefreshKey();
-      if (!force && key === navCnLastRefreshKey) return;
+      if (!forceRefresh && key === navCnLastRefreshKey) return;
       navCnLastRefreshKey = key;
+      const gen = navCnRefreshGen;
       const run = function () {
-        refreshNavCnOnMap();
+        if (gen !== navCnRefreshGen || !navCnEnabled) return;
+        refreshNavCnOnMap(gen);
       };
       if (navChartPerfTier() === "phone" && typeof requestIdleCallback === "function") {
         requestIdleCallback(run, { timeout: 480 });
@@ -1029,13 +1373,35 @@
     });
   }
 
+  /** 机场：粉红倒三角 + 下方四字码；点击 Popup 可看机场名 */
   function navChartAptIcon(ident) {
-    return navIconCacheGet("apt|" + ident, function () {
+    const c = navChartAptColorSet();
+    const symW = 12;
+    const symH = 10;
+    const tipY = 9;
+    const dark = isNavChartDarkBase() ? 1 : 0;
+    const cacheKey = "apt|tri|" + dark + "|" + ident;
+    return navIconCacheGet(cacheKey, function () {
       return L.divIcon({
         className: "nav-chart-apt",
-        html: '<span class="nav-chart-apt-id">' + escapeHtml(ident) + "</span>",
-        iconSize: [48, 14],
-        iconAnchor: [0, 7]
+        html:
+          '<div class="nav-chart-apt-pin">' +
+          '<svg class="nav-chart-apt-tri" viewBox="0 0 12 10" aria-hidden="true">' +
+          '<polygon points="6,' +
+          tipY +
+          " 1,1 11,1\" fill=\"" +
+          c.fill +
+          '" stroke="' +
+          c.stroke +
+          '" stroke-width="1" stroke-linejoin="miter"/></svg>' +
+          '<span class="nav-chart-apt-id" style="color:' +
+          c.text +
+          '">' +
+          escapeHtml(ident) +
+          "</span></div>",
+        iconSize: [symW, symH],
+        iconAnchor: [symW / 2, symH],
+        popupAnchor: [0, -symH - 6]
       });
     });
   }
@@ -1047,9 +1413,12 @@
     return false;
   }
 
-  function refreshNavCnOnMap() {
+  function refreshNavCnOnMap(refGen) {
+    const gen = refGen != null ? refGen : navCnRefreshGen;
+    if (!navCnRefreshOk(gen)) return;
+    showNavCnChartNow();
     navCnLayer.clearLayers();
-    if (!navCnEnabled || !navCnData) return;
+    if (!navCnRefreshOk(gen)) return;
     const z = map.getZoom();
     if (z < 5) return;
 
@@ -1128,6 +1497,8 @@
       }
     }
 
+    if (!navCnRefreshOk(gen)) return;
+
     const awC = NAV_CHART_COLORS.airway;
     const segments = navChartSegments(navCnData);
     if (navCnShow.airway && z >= 6 && segments.length) {
@@ -1141,6 +1512,7 @@
       const hw = lw + 1.4;
       const awyLabelQueue = [];
       for (let s = 0; s < segments.length && drawn < maxSeg; s++) {
+        if ((s & 63) === 0 && !navCnRefreshOk(gen)) return;
         const seg = segments[s];
         const la = seg[2];
         const lo = seg[3];
@@ -1197,6 +1569,8 @@
       }
     }
 
+    if (!navCnRefreshOk(gen)) return;
+
     if (navCnShow.fix && z >= 7 && navCnData.fixes) {
       const allWp = z >= 9;
       const fixSkip = tier === "phone" ? 4 : tier === "tablet" ? 3 : 3;
@@ -1217,6 +1591,8 @@
         navCnLayer.addLayer(m);
       }
     }
+
+    if (!navCnRefreshOk(gen)) return;
 
     if (navCnShow.navaid && z >= 7 && navCnData.navaids) {
       const navLblModes = navChartLabelModesForRefresh(
@@ -1267,6 +1643,8 @@
       }
     }
 
+    if (!navCnRefreshOk(gen)) return;
+
     if (navCnShow.airport && z >= 8 && navCnData.airports) {
       const aptMax = tier === "phone" ? 70 : tier === "tablet" ? 120 : 999999;
       let aptDrawn = 0;
@@ -1277,7 +1655,7 @@
         const lon = ap[2];
         if (!inView(lat, lon)) continue;
         const m = L.marker([lat, wrapLng180(lon)], {
-          pane: "navCnPane",
+          pane: "navCnPaneApt",
           interactive: true,
           icon: navChartAptIcon(ap[0]),
           zIndexOffset: 150
@@ -1301,7 +1679,7 @@
         navCnData = data;
         navIconCacheClear();
         whenPfdScaleReady(function () {
-          scheduleNavCnRefresh(true);
+          if (navCnEnabled) scheduleNavCnRefresh(true);
         });
       })
       .catch(function () {
@@ -1309,7 +1687,15 @@
       });
   }
 
-  map.on("zoomend moveend", scheduleNavCnRefresh);
+  map.on("zoomend", function () {
+    if (!navCnEnabled) return;
+    scheduleNavCnRefresh(false);
+  });
+  map.on("moveend", function () {
+    if (!navCnEnabled) return;
+    if (followPlane) return;
+    scheduleNavCnRefresh(false);
+  });
   map.on("click", function () {
     if (navChartOpenPopup) {
       navChartOpenPopup.closePopup();
@@ -1319,15 +1705,27 @@
   loadNavCnData();
 
   const chkNavCn = document.getElementById("chkNavCn");
+  const navCnWrap = document.getElementById("navCnWrap");
+  const navCnLayersBox = document.getElementById("navCnLayers");
+  function stopNavCnUiBubble(e) {
+    if (e) L.DomEvent.stopPropagation(e);
+  }
+  if (navCnWrap) {
+    navCnWrap.addEventListener("mousedown", stopNavCnUiBubble);
+    navCnWrap.addEventListener("pointerdown", stopNavCnUiBubble);
+    navCnWrap.addEventListener("click", stopNavCnUiBubble);
+    navCnWrap.addEventListener("touchstart", stopNavCnUiBubble);
+  }
+  if (navCnLayersBox) {
+    navCnLayersBox.addEventListener("mousedown", stopNavCnUiBubble);
+    navCnLayersBox.addEventListener("pointerdown", stopNavCnUiBubble);
+    navCnLayersBox.addEventListener("click", stopNavCnUiBubble);
+    navCnLayersBox.addEventListener("touchstart", stopNavCnUiBubble);
+  }
   if (chkNavCn) {
     chkNavCn.checked = navCnEnabled;
     chkNavCn.addEventListener("change", function () {
-      navCnEnabled = !!chkNavCn.checked;
-      try {
-        localStorage.setItem(NAV_CN_STORAGE_KEY, navCnEnabled ? "1" : "0");
-      } catch (eNavChk) {}
-      syncNavCnLayersUi();
-      scheduleNavCnRefresh(true);
+      applyNavCnUserEnabled(chkNavCn.checked);
     });
   }
   const navTypeChk = [
@@ -1348,6 +1746,7 @@
     });
   }
   syncNavCnLayersUi();
+  if (!navCnEnabled) hideNavCnLayersNow();
 
   let planGroup = L.layerGroup().addTo(map);
   let planLine = null;
@@ -1360,6 +1759,12 @@
   /** 沿计划航线累积距离已超过该点此后（海里）亦视为飞过，避免侧偏时永远卡在同一航点 */
   const PASS_ALONG_NM = 0.32;
   let lastTelemetry = null;
+  /** 仪表专用：仅 ingest 更新，供 tickSmooth 读跑道/高度等，不随地图重绘 */
+  let lastInstrumentTel = null;
+  /** 地图/ND/航迹：合并到独立 RAF，避免 SSE 包阻塞姿态仪表 */
+  let pendingMapPayload = null;
+  let mapDisplayPending = false;
+  let mapDisplayTrafficFrame = 0;
   /** 与 msfs_bridge 上航线版本对齐：电脑/手机同一局域网下共用一条导入的 .pln */
   let planSyncInitialized = false;
   let lastServerPlanRev = null;
@@ -1403,8 +1808,13 @@
   const RESID_STEP_MAX_IAS_KT = 0.08;
   const RESID_STEP_MAX_GS_KT = 0.08;
   const RESID_STEP_MAX_VS_FPM = 2.5;
-  const RESID_STEP_MAX_PITCH_DEG = 0.32;
-  const RESID_STEP_MAX_BANK_DEG = 0.38;
+  const RESID_STEP_MAX_PITCH_DEG = 0.18;
+  const RESID_STEP_MAX_BANK_DEG = 0.22;
+  /** 姿态：更少吃包间修正、更长滑动阻尼（与位置/高度带分离） */
+  const ATT_CORRECT_PKT_KEEP = 0.08;
+  const ATT_CORRECT_RESID_MERGE = 0.78;
+  const RESID_TAU_ATT_S = 0.52;
+  const OBS_ATT_VEL_BLEND = 0.28;
   const OBS_PKT_DT_MIN_MS = 16;
   const OBS_PKT_DT_MAX_MS = 8000;
   /** 换机位/传送：位置突变则硬重置运动状态，避免积分把仪表甩飞 */
@@ -1413,6 +1823,11 @@
   let motionResidual = null;
   let lastObs = null;
   let lastSmoothT = 0;
+  const VNAV_DRAW_INTERVAL = 120;
+  let lastVnavDrawT = 0;
+  let speedTapeAnchor = null;
+  let altTapeAnchor = null;
+  let lastAdiTerrKey = "";
 
   function queueCorrection(prev, fresh, keep, merge) {
     if (!Number.isFinite(fresh)) return prev;
@@ -1583,13 +1998,14 @@
     return out;
   }
 
-  function blendMotionVelocities(m, v, k) {
+  function blendMotionVelocities(m, v, k, kAtt) {
+    const ka = kAtt != null && Number.isFinite(kAtt) ? kAtt : k;
     m.hdgDps += (v.hdgDps - m.hdgDps) * k;
     if (v.pitchDps != null && Number.isFinite(v.pitchDps)) {
-      m.pitchDps += (v.pitchDps - m.pitchDps) * k;
+      m.pitchDps += (v.pitchDps - m.pitchDps) * ka;
     }
     if (v.bankDps != null && Number.isFinite(v.bankDps)) {
-      m.bankDps += (v.bankDps - m.bankDps) * k;
+      m.bankDps += (v.bankDps - m.bankDps) * ka;
     }
     m.iasKtPerS += (v.iasKtPerS - m.iasKtPerS) * k;
     m.gsKtPerS += (v.gsKtPerS - m.gsKtPerS) * k;
@@ -1665,14 +2081,14 @@
       r.pitch,
       (z.pitch != null && Number.isFinite(z.pitch) ? z.pitch : 0) -
         (m.pitch != null && Number.isFinite(m.pitch) ? m.pitch : 0),
-      CORRECT_PKT_KEEP,
-      CORRECT_RESID_MERGE
+      ATT_CORRECT_PKT_KEEP,
+      ATT_CORRECT_RESID_MERGE
     );
     r.bank = queueCorrection(
       r.bank,
       deltaAngleDeg(m.bank, z.bank),
-      CORRECT_PKT_KEEP,
-      CORRECT_RESID_MERGE
+      ATT_CORRECT_PKT_KEEP,
+      ATT_CORRECT_RESID_MERGE
     );
     const freshIas =
       z.ias != null &&
@@ -1711,6 +2127,7 @@
     const kPos = 1 - Math.exp(-dtS / RESID_TAU_POS_S);
     const kHdg = 1 - Math.exp(-dtS / RESID_TAU_HDG_S);
     const kSc = 1 - Math.exp(-dtS / RESID_TAU_SCALAR_S);
+    const kAtt = 1 - Math.exp(-dtS / RESID_TAU_ATT_S);
 
     const bl = bleedResidualStep(r.lat, kPos, RESID_STEP_MAX_LAT);
     m.lat += bl.step;
@@ -1730,12 +2147,12 @@
     r.hdg = bh.left;
 
     if (m.pitch != null && Number.isFinite(m.pitch)) {
-      const bp = bleedResidualStep(r.pitch, kSc, RESID_STEP_MAX_PITCH_DEG);
+      const bp = bleedResidualStep(r.pitch, kAtt, RESID_STEP_MAX_PITCH_DEG);
       m.pitch += bp.step;
       r.pitch = bp.left;
     }
     if (m.bank != null && Number.isFinite(m.bank)) {
-      const bb = bleedResidualStep(r.bank, kSc, RESID_STEP_MAX_BANK_DEG);
+      const bb = bleedResidualStep(r.bank, kAtt, RESID_STEP_MAX_BANK_DEG);
       m.bank += bb.step;
       r.bank = bb.left;
     }
@@ -1834,10 +2251,13 @@
     }
 
     if (dtMs >= OBS_PKT_DT_MIN_MS && dtMs <= OBS_PKT_DT_MAX_MS) {
-      blendMotionVelocities(motion, measureVelocitiesFromObs(lastObs.z, z, dtMs), OBS_VEL_BLEND);
+      blendMotionVelocities(
+        motion,
+        measureVelocitiesFromObs(lastObs.z, z, dtMs),
+        OBS_VEL_BLEND,
+        OBS_ATT_VEL_BLEND
+      );
     } else {
-      motion.pitch = z.pitch;
-      motion.bank = z.bank;
       motion.pitchDps = 0;
       motion.bankDps = 0;
       if (z.vs != null && Number.isFinite(z.vs)) {
@@ -1853,11 +2273,121 @@
     lastObs = { t: tNow, z: z };
   }
 
+  /** 仪表链路：只入库运动状态与姿态源数据，不触发地图/ND */
+  function slimTelForInstruments(data) {
+    if (!data || !data.ok) return data;
+    var o = Object.assign({}, data);
+    delete o.airport_gnd;
+    delete o.trail;
+    delete o.traffic;
+    return o;
+  }
+
+  function ingestAirportGndFromTelemetry(data) {
+    if (!data || !data.ok) return;
+    if (data.airport_gnd && typeof data.airport_gnd === "object") {
+      var g = data.airport_gnd;
+      if (g.icao && !isMainlandChinaIcao(g.icao)) return;
+      if (gndSurfHasFeatures(g)) {
+        ndGndSnapshot =
+          ndGndSnapshot && ndGndSnapshot.icao === g.icao
+            ? mergeNdGndLayers(g, ndGndSnapshot)
+            : g;
+        ndGndSnapshotAt = performance.now();
+      }
+      if (typeof data.airport_gnd_rev === "number") ndGndServerRev = data.airport_gnd_rev;
+      return;
+    }
+    var icao = data.airport_gnd_icao ? String(data.airport_gnd_icao).trim().toUpperCase() : "";
+    var rev = data.airport_gnd_rev;
+    if (!icao || typeof rev !== "number" || rev === ndGndServerRev) return;
+    if (ndGndFetchInFlight === icao) return;
+    ndGndFetchInFlight = icao;
+    fetch(AIRPORT_GND_URL + "?icao=" + encodeURIComponent(icao), { cache: "no-store" })
+      .then(function (r) {
+        return r.json();
+      })
+      .then(function (j) {
+        ndGndFetchInFlight = null;
+        if (j && j.ok && j.airport_gnd) {
+          ingestAirportGndFromTelemetry({
+            ok: true,
+            airport_gnd: j.airport_gnd,
+            airport_gnd_rev: j.rev != null ? j.rev : rev
+          });
+        }
+      })
+      .catch(function () {
+        ndGndFetchInFlight = null;
+      });
+  }
+
+  function ingestInstrumentPacket(data, tNow) {
+    if (!data || !data.ok) {
+      lastInstrumentTel = null;
+      return;
+    }
+    ingestMotionObservation(data, tNow);
+    lastInstrumentTel = slimTelForInstruments(data);
+  }
+
+  function applyMapPayload(data) {
+    if (!data) return;
+    lastTelemetry = data;
+    if (!data.ok) {
+      lastMapObsT = 0;
+      stabilizeTrafficList([], null, null, null);
+      updateTraffic([]);
+      updateCollisionWarnings(null);
+      updateTcassSuppressMapOverlay(null);
+      if (Array.isArray(data.trail)) {
+        if (data.trail.length >= 2) {
+          updateTrail(data.trail.map(function (p) { return [p[0], p[1]]; }));
+        } else if (data.trail.length === 0) updateTrail([]);
+      }
+      resetNdWxSweepAnim();
+      ndWxSweepPos = 1;
+      ndWxSweepDone = true;
+      redrawNd();
+      redrawAdiVnavProfile();
+      syncNdToolbarChrome();
+      return;
+    }
+    lastMapObsT = performance.now();
+    const lat = data.lat;
+    const lon = data.lon;
+    const trail = (data.trail || []).map(function (p) { return [p[0], p[1]]; });
+    updateTrail(trail);
+    updateMapAircraftMarker();
+    updateTcassSuppressMapOverlay(data);
+    updatePfdNdToolbarStats(data);
+    mapDisplayTrafficFrame++;
+    if (mapDisplayTrafficFrame % 2 === 0) {
+      updateCollisionWarnings(data);
+      updateTraffic(data.traffic);
+    }
+    syncNdToolbarChrome();
+    planHudLine(lat, lon);
+  }
+
+  function queueMapDisplay(data) {
+    pendingMapPayload = data;
+    mapDisplayPending = true;
+  }
+
+  function tickMapDisplay(now) {
+    requestAnimationFrame(tickMapDisplay);
+    if (!mapDisplayPending) return;
+    mapDisplayPending = false;
+    applyMapPayload(pendingMapPayload);
+    pendingMapPayload = null;
+  }
+
   function tickSmooth(now) {
     requestAnimationFrame(tickSmooth);
     const t = typeof now === "number" ? now : performance.now();
 
-    if (!lastTelemetry || !lastTelemetry.ok || !motion) {
+    if (!lastInstrumentTel || !motion) {
       lastSmoothT = 0;
       tapeDispReady = false;
       return;
@@ -1922,17 +2452,21 @@
       dispLon
     );
     const navRw = navAcState();
+    /* 跑道层已在 attBank/attPitch 内随 CSS 旋转，投影勿再叠 pitch/bank（否则起飞时双重变换闪烁） */
     updateAdiRunwayOverlay(
-      lastTelemetry,
-      dispPitch,
-      dispBank,
+      lastInstrumentTel,
+      0,
+      0,
       dispAlt,
       navRw ? navRw.hdg : dispHdg,
       navRw ? navRw.lat : dispLat,
       navRw ? navRw.lon : dispLon
     );
-    updatePfdNdToolbarStats(lastTelemetry);
-    redrawAdiVnavProfile();
+    if (t - lastVnavDrawT >= VNAV_DRAW_INTERVAL) {
+      lastVnavDrawT = t;
+      redrawAdiVnavProfile();
+    }
+    redrawNd();
     if (planWaypoints.length) {
       const mapAcPlan = mapAcState();
       if (mapAcPlan) planHudLine(mapAcPlan.lat, mapAcPlan.lon);
@@ -2116,6 +2650,8 @@
     if (!inner || !bug) return;
     if (ias == null || !Number.isFinite(ias) || ias < 0) {
       inner.innerHTML = "";
+      inner.style.transform = "";
+      speedTapeAnchor = null;
       bug.className = "tape-window";
       bug.textContent = "—";
       return;
@@ -2125,20 +2661,25 @@
     const innerH = 218 - topPad - botPad;
     const cx = innerH / 2;
     const pxPerKt = 2.5 * (innerH / 160);
-    let html = "";
-    const center = Math.round(ias / 10) * 10;
-    for (let v = center - 95; v <= center + 95; v += 5) {
-      if (v < 0) continue;
-      const y = cx + (ias - v) * pxPerKt;
-      if (y < -10 || y > innerH + 10) continue;
-      const major = v % 20 === 0;
-      const mid = !major && v % 10 === 0;
-      const cls = major ? " major" : mid ? " mid" : " minor";
-      html += '<div class="tape-slide tape-slide-speed' + cls + '" style="top:' + y + 'px">';
-      html += '<span class="tape-val-num">' + (major ? v : "") + "</span>";
-      html += '<span class="tape-line"></span></div>';
+    const anchor = Math.round(ias / 10) * 10;
+    if (speedTapeAnchor !== anchor) {
+      speedTapeAnchor = anchor;
+      let html = "";
+      for (let v = anchor - 95; v <= anchor + 95; v += 5) {
+        if (v < 0) continue;
+        const y = cx + (anchor - v) * pxPerKt;
+        if (y < -10 || y > innerH + 10) continue;
+        const major = v % 20 === 0;
+        const mid = !major && v % 10 === 0;
+        const cls = major ? " major" : mid ? " mid" : " minor";
+        html += '<div class="tape-slide tape-slide-speed' + cls + '" style="top:' + y + 'px">';
+        html += '<span class="tape-val-num">' + (major ? v : "") + "</span>";
+        html += '<span class="tape-line"></span></div>';
+      }
+      inner.innerHTML = html;
     }
-    inner.innerHTML = html;
+    inner.style.transform =
+      "translate3d(0," + ((ias - anchor) * pxPerKt).toFixed(3) + "px,0)";
     bug.className = "tape-window";
     if (rollOdometerUseDrum()) {
       rollOdSyncHostRow(bug, String(Math.round(ias)), false);
@@ -2153,6 +2694,8 @@
     if (!inner || !bug) return;
     if (altFt == null || !Number.isFinite(altFt)) {
       inner.innerHTML = "";
+      inner.style.transform = "";
+      altTapeAnchor = null;
       bug.className = "tape-window tape-window-alt";
       bug.textContent = "—";
       return;
@@ -2163,31 +2706,36 @@
     const cx = innerH / 2;
     const pxPerKt = 2.5 * (innerH / 160);
     const pxPer100ft = (5 * pxPerKt) / 100;
-    let html = "";
-    const center = Math.round(altFt / 100) * 100;
-    for (let k = -19; k <= 19; k++) {
-      const v = center + k * 100;
-      if (v < 0) continue;
-      const y = cx + (altFt - v) * pxPer100ft;
-      if (y < -10 || y > innerH + 10) continue;
-      const major = v % 500 === 0;
-      const mid = !major && v % 200 === 0;
-      const cls = major ? " major" : mid ? " mid" : " minor";
-      html += '<div class="tape-slide tape-slide-alt' + cls + '" style="top:' + y + 'px">';
-      html += '<span class="tape-val-num">';
-      if (major) {
-        const lp = altSplitLast3Ft(v);
-        html +=
-          '<span class="tape-alt-lg">' +
-          lp.lg +
-          '</span><span class="tape-alt-sm">' +
-          lp.sm +
-          "</span>";
+    const anchor = Math.round(altFt / 100) * 100;
+    if (altTapeAnchor !== anchor) {
+      altTapeAnchor = anchor;
+      let html = "";
+      for (let k = -19; k <= 19; k++) {
+        const v = anchor + k * 100;
+        if (v < 0) continue;
+        const y = cx + (anchor - v) * pxPer100ft;
+        if (y < -10 || y > innerH + 10) continue;
+        const major = v % 500 === 0;
+        const mid = !major && v % 200 === 0;
+        const cls = major ? " major" : mid ? " mid" : " minor";
+        html += '<div class="tape-slide tape-slide-alt' + cls + '" style="top:' + y + 'px">';
+        html += '<span class="tape-val-num">';
+        if (major) {
+          const lp = altSplitLast3Ft(v);
+          html +=
+            '<span class="tape-alt-lg">' +
+            lp.lg +
+            '</span><span class="tape-alt-sm">' +
+            lp.sm +
+            "</span>";
+        }
+        html += "</span>";
+        html += '<span class="tape-line"></span></div>';
       }
-      html += "</span>";
-      html += '<span class="tape-line"></span></div>';
+      inner.innerHTML = html;
     }
-    inner.innerHTML = html;
+    inner.style.transform =
+      "translate3d(0," + ((altFt - anchor) * pxPer100ft).toFixed(3) + "px,0)";
     const bp = altSplitLast3Ft(altFt);
     updateAltBugRoller(bug, bp.lg, bp.sm);
   }
@@ -2285,6 +2833,15 @@
     const pFill = document.getElementById("attTerrainFill");
     const pStr = document.getElementById("attTerrainStroke");
     if (!el || !pFill || !pStr) return;
+    const latK = lat != null && Number.isFinite(lat) ? Math.round(lat * 400) / 400 : 0;
+    const lonK = lon != null && Number.isFinite(lon) ? Math.round(lon * 400) / 400 : 0;
+    const geK =
+      groundElevFt != null && Number.isFinite(groundElevFt)
+        ? Math.round(groundElevFt / 20) * 20
+        : 0;
+    const key = latK + "|" + lonK + "|" + geK;
+    if (key === lastAdiTerrKey) return;
+    lastAdiTerrKey = key;
     const o = buildAdiTerrainPath(groundElevFt, lat, lon);
     pFill.setAttribute("d", o.dFill);
     pStr.setAttribute("d", o.dStroke);
@@ -2558,6 +3115,7 @@
       data.lat,
       data.lon
     );
+    updateAdiRunwayOverlay(data, 0, 0, data.alt_ft, data.heading_deg, data.lat, data.lon);
   }
 
   function fmtNum(n, d) {
@@ -2621,38 +3179,194 @@
     return latlngs.map(function (p) { return [p[0], p[1] + k * 360]; });
   }
 
+  /** 机标经度与航迹条带同一「世界副本」，避免间歇性横偏 */
+  function alignLonToTrailStrip(acLon, trailLastLon) {
+    const w = wrapLng180(acLon);
+    if (trailLastLon == null || !Number.isFinite(trailLastLon)) return w;
+    const k = Math.round((trailLastLon - w) / 360);
+    return w + k * 360;
+  }
+
+  function mapMarkerLonForTrail(acLon) {
+    if (!mapTrailLatLngs || !mapTrailLatLngs.length) return wrapLng180(acLon);
+    return alignLonToTrailStrip(acLon, mapTrailLatLngs[mapTrailLatLngs.length - 1][1]);
+  }
+
+  function syncTrailEndToPlane(lat, lon) {
+    if (!mapTrailLatLngs || mapTrailLatLngs.length < 2 || !trailLayer) return;
+    const n = mapTrailLatLngs.length;
+    const last = mapTrailLatLngs[n - 1];
+    if (last[0] === lat && last[1] === lon) return;
+    mapTrailLatLngs[n - 1] = [lat, lon];
+    trailLayer.setLatLngs(trimTrailDisplayPoints(mapTrailLatLngs));
+  }
+
+  function planePosTipLine(mapAc) {
+    if (!mapAc) return "";
+    const lon = wrapLng180(mapAc.lon);
+    const coord =
+      fmtNum(mapAc.lat, 2) + "°, " + fmtNum(lon, 2) + "°";
+    if (mapAc.alt != null && Number.isFinite(mapAc.alt)) {
+      return coord + " · " + Math.round(mapAc.alt) + " ft";
+    }
+    return coord;
+  }
+
+  /** 航迹末段方位（与绿线绘制共用，保证机标与 GPS 轨迹平行） */
+  function trailEndBearingDeg(pts) {
+    if (!pts || pts.length < 2) return null;
+    const n = pts.length;
+    for (let i = n - 1; i >= 1; i--) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      if (haversineNm(a[0], a[1], b[0], b[1]) > 0.00015) {
+        return enuBearingDeg(a[0], a[1], b[0], b[1]);
+      }
+    }
+    return null;
+  }
+
+  /** 屏幕坐标下线段方位（与 Leaflet 绘制/ CSS rotate 一致） */
+  function trailSegmentBearingScreen(a, b) {
+    if (!a || !b) return null;
+    const latA = a.lat != null ? a.lat : a[0];
+    const lonA = a.lng != null ? a.lng : a.lon != null ? a.lon : a[1];
+    const latB = b.lat != null ? b.lat : b[0];
+    const lonB = b.lng != null ? b.lng : b.lon != null ? b.lon : b[1];
+    if (
+      latA == null ||
+      !Number.isFinite(latA) ||
+      lonA == null ||
+      !Number.isFinite(lonA) ||
+      latB == null ||
+      !Number.isFinite(latB) ||
+      lonB == null ||
+      !Number.isFinite(lonB)
+    ) {
+      return null;
+    }
+    const pa = map.latLngToContainerPoint(L.latLng(latA, lonA));
+    const pb = map.latLngToContainerPoint(L.latLng(latB, lonB));
+    const dx = pb.x - pa.x;
+    const dy = pb.y - pa.y;
+    if (dx * dx + dy * dy < 1) return null;
+    return normHdg((Math.atan2(dx, -dy) * 180) / Math.PI);
+  }
+
+  function planeMapBearingDeltaDeg(a, b) {
+    let d = normHdg(b) - normHdg(a);
+    if (d > 180) d -= 360;
+    if (d < -180) d += 360;
+    return Math.abs(d);
+  }
+
+  /** 地图图标用真航向（与卫星图北向、GPS 航迹方位一致） */
+  function planeMapTrueHeadingDeg(tel, mapAc) {
+    const mv =
+      tel && tel.mag_var_deg != null && Number.isFinite(tel.mag_var_deg)
+        ? tel.mag_var_deg
+        : null;
+    if (tel && tel.heading_deg != null && Number.isFinite(tel.heading_deg) && mv != null) {
+      return normHdg(tel.heading_deg + mv);
+    }
+    if (tel && tel.heading_true_deg != null && Number.isFinite(tel.heading_true_deg)) {
+      return normHdg(tel.heading_true_deg);
+    }
+    if (tel && tel.heading_deg != null && Number.isFinite(tel.heading_deg)) {
+      return normHdg(tel.heading_deg);
+    }
+    return mapAc && mapAc.hdg != null && Number.isFinite(mapAc.hdg) ? normHdg(mapAc.hdg) : 0;
+  }
+
+  /** 计算机标朝向：空中跟绿线末段；地面/低速跟真航向 */
+  function planeMapBearingCompute(mapAc) {
+    const tel = lastTelemetry;
+    const trueHdg = planeMapTrueHeadingDeg(tel, mapAc);
+    const gs =
+      tel && tel.groundspeed_knots != null && Number.isFinite(tel.groundspeed_knots)
+        ? tel.groundspeed_knots
+        : null;
+    const onGnd = tel && tel.ok && isUserOnGround(tel);
+    const lowSpeed = gs != null && gs < 30;
+
+    if (onGnd || lowSpeed) return trueHdg;
+
+    let trailBrg = null;
+    if (mapTrailLatLngs && mapTrailLatLngs.length >= 2) {
+      const brgRaw = trailEndBearingDeg(mapTrailLatLngs);
+      if (brgRaw != null && Number.isFinite(brgRaw)) trailBrg = normHdg(brgRaw);
+    }
+    if (trailBrg != null) {
+      if (gs != null && gs < 60 && planeMapBearingDeltaDeg(trailBrg, trueHdg) > 10) {
+        return trueHdg;
+      }
+      return trailBrg;
+    }
+    if (
+      tel &&
+      tel.ground_track_deg != null &&
+      Number.isFinite(tel.ground_track_deg)
+    ) {
+      return normHdg(tel.ground_track_deg);
+    }
+    return trueHdg;
+  }
+
+  function recomputePlaneMapBearingHold(mapAc, force) {
+    const next = planeMapBearingCompute(mapAc);
+    const tel = lastTelemetry;
+    const gs =
+      tel && tel.groundspeed_knots != null && Number.isFinite(tel.groundspeed_knots)
+        ? tel.groundspeed_knots
+        : null;
+    const preferHeading =
+      force ||
+      (tel && tel.ok && isUserOnGround(tel)) ||
+      (gs != null && gs < 30);
+    if (preferHeading || !planeMapBrgHoldReady) {
+      planeMapBrgHold = next;
+      planeMapBrgHoldReady = true;
+      return;
+    }
+    if (planeMapBearingDeltaDeg(planeMapBrgHold, next) >= PLANE_MAP_BRG_LOCK_DEG) {
+      planeMapBrgHold = next;
+    }
+  }
+
+  function planeMapBearingDeg(mapAc) {
+    return planeMapBrgHoldReady ? planeMapBrgHold : planeMapBearingCompute(mapAc);
+  }
+
   function updateMapAircraftMarker() {
     const mapAc = mapAcState();
     if (!mapAc || !marker) return;
-    const mapLon = mapAc.lon;
-    marker.setLatLng([mapAc.lat, mapLon]);
+    const lat = mapAc.lat;
+    const lon = mapMarkerLonForTrail(mapAc.lon);
+    marker.setLatLng([lat, lon]);
+    syncTrailEndToPlane(lat, lon);
+    recomputePlaneMapBearingHold(mapAc);
     const el = marker.getElement();
     const wrap = el && el.querySelector(".plane-hdg");
-    if (wrap) wrap.style.transform = "rotate(" + normHdg(mapAc.hdg) + "deg)";
-    const posTip =
-      fmtNum(mapAc.lat, 5) +
-      "°, " +
-      fmtNum(mapLon, 5) +
-      "°" +
-      (mapAc.alt != null && Number.isFinite(mapAc.alt)
-        ? " · " + Math.round(mapAc.alt) + " ft"
-        : "");
+    planeIconApplyTransform(wrap, planeMapBearingDeg(mapAc), map.getZoom());
+    const posTip = planePosTipLine(mapAc);
     const planeTip = marker.getTooltip();
     if (planeTip) marker.setTooltipContent(posTip);
     else {
       marker.bindTooltip(posTip, {
         permanent: true,
         direction: "top",
-        offset: [0, -10],
+        offset: [0, -16],
         className: "plane-pos-tip",
         sticky: false
       });
     }
-    if (followPlane) panMapFollowPlane(L.latLng(mapAc.lat, mapLon));
   }
 
   function updateTrail(latlngs) {
     if (!latlngs || latlngs.length === 0) {
+      lastTrailRawLatLngs = null;
+      mapTrailLatLngs = null;
+      planeMapBrgHoldReady = false;
       if (trailLayer) {
         map.removeLayer(trailLayer);
         trailLayer = null;
@@ -2666,12 +3380,65 @@
       pts = [[a, b], [a + 1e-5, b]];
     }
     if (pts.length < 2) return;
+    lastTrailRawLatLngs = pts.map(function (p) {
+      return [p[0], p[1]];
+    });
     if (trailLayer) map.removeLayer(trailLayer);
     let fixed = unwrapLatLngsForPolyline(pts);
     if (lastTelemetry && lastTelemetry.ok) {
       fixed = shiftLngStripToRef(fixed, lastTelemetry.lon);
     }
-    trailLayer = L.polyline(fixed, { color: "#3fb950", weight: 3, opacity: 0.85 }).addTo(map);
+    mapTrailLatLngs = fixed;
+    recomputePlaneMapBearingHold(mapAcState(), true);
+    trailLayer = L.polyline(trimTrailDisplayPoints(fixed), {
+      color: "#3fb950",
+      weight: 3,
+      opacity: 0.85
+    }).addTo(map);
+    syncPlaneMarkerBearingApply();
+  }
+
+  function trailEndTrimNm() {
+    const z = map.getZoom();
+    const sc = planeIconScaleForZoom(z);
+    const base = TRAIL_END_TRIM_NM_MIN + (TRAIL_END_TRIM_NM_MAX - TRAIL_END_TRIM_NM_MIN) * sc;
+    return base * trailZoomOutMul(z);
+  }
+
+  /** 按屏幕像素把绿线截到机尾后，机头在航线最前端 */
+  function trailIconClearanceNm(_brg, _endLl) {
+    return trailEndTrimNm();
+  }
+
+  /** 绿线止于机身后方，避免穿过/盖住本机符号 */
+  function trimTrailDisplayPoints(pts) {
+    if (!pts || pts.length < 2) return pts;
+    const n = pts.length;
+    const end = pts[n - 1];
+    const brgGeo = trailEndBearingDeg(pts);
+    if (brgGeo == null) return pts;
+    const brgTrim = brgGeo;
+    let segLen = 0;
+    for (let i = n - 1; i >= 1; i--) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      segLen = haversineNm(a[0], a[1], b[0], b[1]);
+      if (segLen > 0.00015) break;
+    }
+    const trimUse = Math.min(
+      trailIconClearanceNm(brgTrim, L.latLng(end[0], end[1])),
+      segLen * 0.92
+    );
+    if (trimUse <= 0) return pts;
+    const stop = pointAtNm(end[0], end[1], normHdg(brgGeo + 180), trimUse);
+    const out = pts.slice();
+    out[n - 1] = [stop.lat, stop.lon];
+    return out;
+  }
+
+  function refreshTrailDisplayForZoom() {
+    if (!mapTrailLatLngs || mapTrailLatLngs.length < 2 || !trailLayer) return;
+    trailLayer.setLatLngs(trimTrailDisplayPoints(mapTrailLatLngs));
   }
 
   function trafficListFingerprint(list) {
@@ -2775,6 +3542,8 @@
 
   let ndGndSnapshot = null;
   let ndGndSnapshotAt = 0;
+  let ndGndServerRev = -1;
+  let ndGndFetchInFlight = null;
   let ndGroundHoldUntil = 0;
   const ND_GND_SURF_HOLD_MS = 15000;
   const ND_GROUND_HOLD_MS = 2800;
@@ -2799,6 +3568,25 @@
     return Array.isArray(arr) ? arr.length : 0;
   }
 
+  /** 场面图层数量指纹：OSM 异步补全后须重新 auto-fit，避免首帧只含跑道时缩放锁死 */
+  function ndGndDataFitKey(gnd) {
+    if (!gnd) return "";
+    const icao = String(gnd.icao || "")
+      .trim()
+      .toUpperCase();
+    return (
+      icao +
+      "|tw" +
+      gndLayerCount(gnd.taxiways) +
+      "|ap" +
+      gndLayerCount(gnd.aprons) +
+      "|rw" +
+      gndLayerCount(gnd.runways) +
+      "|bd" +
+      gndLayerCount(gnd.buildings)
+    );
+  }
+
   /** 遥测场面若缺机坪/停机位，沿用同机场快照中更完整的一层 */
   function mergeNdGndLayers(g, snap) {
     if (!g || !snap || !g.icao || g.icao !== snap.icao) return g;
@@ -2817,6 +3605,9 @@
     }
     if (gndLayerCount(out.stands) < gndLayerCount(snap.stands)) {
       out.stands = snap.stands;
+    }
+    if (gndLayerCount(out.runways) < gndLayerCount(snap.runways)) {
+      out.runways = snap.runways;
     }
     return out;
   }
@@ -2841,6 +3632,25 @@
       ndGroundHoldUntil = now + ND_GROUND_HOLD_MS;
       return true;
     }
+    /* 起飞/爬升：离地后尽快退出 ND 场面模式，减轻主线程（姿态仪）压力 */
+    if (tel && tel.ok) {
+      const agl =
+        tel.agl_game_ft != null && Number.isFinite(tel.agl_game_ft)
+          ? tel.agl_game_ft
+          : tel.agl_baro_ft;
+      const gs = tel.groundspeed_knots;
+      if (agl != null && agl > 350) return false;
+      if (
+        gs != null &&
+        Number.isFinite(gs) &&
+        gs > 70 &&
+        agl != null &&
+        Number.isFinite(agl) &&
+        agl > 60
+      ) {
+        return false;
+      }
+    }
     return now < ndGroundHoldUntil;
   }
 
@@ -2852,8 +3662,27 @@
       }
       return null;
     }
-    const g = tel.airport_gnd;
+    const g =
+      tel.airport_gnd ||
+      (tel.airport_gnd_icao &&
+      ndGndSnapshot &&
+      String(tel.airport_gnd_icao).trim().toUpperCase() ===
+        String(ndGndSnapshot.icao || "")
+          .trim()
+          .toUpperCase()
+        ? ndGndSnapshot
+        : null);
     if (g && g.icao && !isMainlandChinaIcao(g.icao)) return null;
+    if (
+      g &&
+      g.icao &&
+      !gndSurfHasFeatures(g) &&
+      ndGndSnapshot &&
+      ndGndSnapshot.icao === g.icao &&
+      gndSurfHasFeatures(ndGndSnapshot)
+    ) {
+      return ndGndSnapshot;
+    }
     let resolved = g;
     if (
       g &&
@@ -3186,7 +4015,7 @@
       if (m.getTooltip()) m.unbindTooltip();
       m.bindTooltip(text, {
         direction: "top",
-        offset: [0, -8],
+        offset: [0, -14],
         opacity: 0.92,
         className: "traffic-tip" + (pinned ? " traffic-tip--pinned" : ""),
         permanent: pinned,
@@ -3937,6 +4766,7 @@
   let ndGndBasePxPerM = 0.045;
   let ndGndLayoutIcao = null;
   let ndGndLayoutFitKey = null;
+  let ndGndLayoutDataKey = null;
   let ndGndWasOnGround = false;
   let ndGndUserOverrodeZoom = false;
   /** ND 弧模式：地形 / 气象雷达叠层 */
@@ -3953,10 +4783,10 @@
   const ND_GND_ZOOM_DISP_MAX = 5;
   const ND_GND_ZOOM_DISP_DEFAULT = 1;
   const ND_GND_ZOOM_DISP_STEP = 1;
-  /** 底图缩放仍按内部档 5～10 计算（×1→6，×5→10） */
+  /** 底图缩放仍按原内部档 5～10 计算（×1→6.4，×5→10） */
   const ND_GND_SCALE_INTERNAL_MIN = 5;
   const ND_GND_SCALE_INTERNAL_MAX = 10;
-  const ND_GND_SCALE_INTERNAL_DEFAULT = 6;
+  const ND_GND_SCALE_INTERNAL_DEFAULT = 6.4;
 
   /** 显示倍率映射到底图缩放系数：跑道底图可继续放大 */
   const ND_GND_SCALE_MIN = 1.05;
@@ -3971,7 +4801,7 @@
     return Math.max(min, Math.min(max, v));
   }
 
-  /** UI ×1～×5 → 内部缩放档 6～10（×1 默认略小，×5 最大不变） */
+  /** UI ×1～×5 → 内部缩放档 6.4～10（×1 默认略小，×5 最大不变） */
   function ndGndUiToScaleInternal(uiDisp) {
     const d = ndGndClamp(uiDisp, ND_GND_ZOOM_DISP_MIN, ND_GND_ZOOM_DISP_MAX);
     const uiSpan = ND_GND_ZOOM_DISP_MAX - ND_GND_ZOOM_DISP_MIN;
@@ -4013,7 +4843,9 @@
   /** 仅在本机地面且已有场面数据时显示 ND 机场底图（离地自动隐藏） */
   function ndArcGndUnderlayVisible(tel) {
     if (!tel || !tel.ok || ndPlanMode) return false;
-    if (!resolveNdAirportGnd(tel)) return false;
+    const gnd = resolveNdAirportGnd(tel);
+    if (!gnd || !gndSurfHasFeatures(gnd)) return false;
+    if (gndLayerCount(gnd.runways) < 1) return false;
     return isUserOnGround(tel);
   }
 
@@ -4173,6 +5005,46 @@
     const px = seg.east * t;
     const py = seg.north * t;
     return Math.hypot(o.east - px, o.north - py);
+  }
+
+  /** 跑道中心线真方位：与当前航向更接近的一端为“前” */
+  function gndRunwayAxisBearingDeg(rw, preferBrg) {
+    if (!rw || rw.lat_thr == null || rw.lon_thr == null || rw.lat_end == null || rw.lon_end == null) {
+      return null;
+    }
+    const fwd = enuBearingDeg(rw.lat_thr, rw.lon_thr, rw.lat_end, rw.lon_end);
+    const rev = normHdg(fwd + 180);
+    if (preferBrg == null || !Number.isFinite(preferBrg)) return fwd;
+    return planeMapBearingDeltaDeg(preferBrg, fwd) <= planeMapBearingDeltaDeg(preferBrg, rev)
+      ? fwd
+      : rev;
+  }
+
+  /** 场面 ND：近跑道/滑行道时将旋转对齐 OSM 跑道轴（避免 SimConnect 地面航向数度偏差） */
+  function ndGndSnapCompassRefDeg(baseTrue, gnd, acLat, acLon, tel) {
+    if (baseTrue == null || !Number.isFinite(baseTrue) || !gnd) return baseTrue;
+    const gs =
+      tel && tel.groundspeed_knots != null && Number.isFinite(tel.groundspeed_knots)
+        ? tel.groundspeed_knots
+        : null;
+    if (gs != null && gs >= 35) return baseTrue;
+    const runways = gnd.runways;
+    if (!Array.isArray(runways) || !runways.length) return baseTrue;
+    let bestRw = null;
+    let bestD = Infinity;
+    for (let ri = 0; ri < runways.length; ri++) {
+      const d = gndDistPointToRunwayM(acLat, acLon, runways[ri]);
+      if (d < bestD) {
+        bestD = d;
+        bestRw = runways[ri];
+      }
+    }
+    if (!bestRw || bestD > 420) return baseTrue;
+    const axis = gndRunwayAxisBearingDeg(bestRw, baseTrue);
+    if (axis == null) return baseTrue;
+    const delta = planeMapBearingDeltaDeg(baseTrue, axis);
+    const limit = bestD <= 90 ? 45 : bestD <= 220 ? 32 : 22;
+    return delta <= limit ? axis : baseTrue;
   }
 
   function gndStandOnRunway(st, runways) {
@@ -4555,17 +5427,33 @@
       ndGndLayoutIcao != null ? String(ndGndLayoutIcao).trim().toUpperCase() : "";
     const fitChg = ndGndLayoutFitKey !== fitKey;
     ndGndWasOnGround = true;
+    const dataKey = ndGndDataFitKey(gnd);
+    const dataReady =
+      gndLayerCount(gnd.taxiways) >= 3 &&
+      (gndLayerCount(gnd.runways) >= 1 || gndLayerCount(gnd.aprons) >= 1);
 
-    /** 首次显示、确认换机场、或未手动缩放时画布变大/变小；同一 ICAO 锁定后不因航向重算 */
+    /** 首次显示、换机场、或画布尺寸变化时重算缩放（OSM 补全时不改缩放，避免场面图缩放闪烁） */
     const firstFit = !prevIcao && !!icao;
     const airportChange = !!prevIcao && !!icao && icao !== prevIcao;
+    const dataUpgrade =
+      !!icao &&
+      icao === prevIcao &&
+      dataReady &&
+      ndGndLayoutDataKey != null &&
+      dataKey !== ndGndLayoutDataKey;
     const shouldAutoFit =
-      firstFit ||
       airportChange ||
-      (fitChg && !ndGndUserOverrodeZoom);
+      (firstFit && dataReady) ||
+      (fitChg && !ndGndUserOverrodeZoom && dataReady);
+    if (dataUpgrade && dataReady) {
+      ndGndLayoutDataKey = dataKey;
+    }
     if (shouldAutoFit) {
       ndGndLayoutIcao = icao || gnd.icao;
       ndGndLayoutFitKey = fitKey;
+      if (dataReady || airportChange || firstFit) {
+        ndGndLayoutDataKey = dataKey;
+      }
       applyNdGndAutoFit(
         gnd,
         acLat,
@@ -4654,7 +5542,7 @@
         ctx,
         sx,
         sy,
-        t.heading_deg,
+        ndTrafficSymbolHeadingDeg(t, true),
         hdg,
         trafficDisplayStyle(t, tel)
       );
@@ -5548,6 +6436,49 @@
     return null;
   }
 
+  /** ND 场面图旋转：地面/低速用真航向（与跑道经纬度、主地图机标一致） */
+  function ndCompassRefDeg(tel, mapAc, gndMode) {
+    let base = 0;
+    if (gndMode && mapAc && tel && tel.ok) {
+      base = planeMapBearingCompute(mapAc);
+      const gnd = resolveNdAirportGnd(tel);
+      if (gnd && mapAc.lat != null && mapAc.lon != null) {
+        base = ndGndSnapCompassRefDeg(base, gnd, mapAc.lat, mapAc.lon, tel);
+      }
+      return base;
+    }
+    if (mapAc && mapAc.hdg != null && Number.isFinite(mapAc.hdg)) {
+      return normHdg(mapAc.hdg);
+    }
+    if (tel && tel.heading_deg != null && Number.isFinite(tel.heading_deg)) {
+      return normHdg(tel.heading_deg);
+    }
+    return 0;
+  }
+
+  function ndHeadingMagFromTrue(trueDeg, tel) {
+    const mv = ndCourseMagVarDegFromTelemetry();
+    if (mv != null && Number.isFinite(mv)) {
+      return normHdg(trueDeg - mv);
+    }
+    return normHdg(trueDeg);
+  }
+
+  function ndTrafficSymbolHeadingDeg(t, gndMode) {
+    if (!t) return null;
+    if (
+      gndMode &&
+      t.heading_true_deg != null &&
+      Number.isFinite(t.heading_true_deg)
+    ) {
+      return normHdg(t.heading_true_deg);
+    }
+    if (t.heading_deg != null && Number.isFinite(t.heading_deg)) {
+      return normHdg(t.heading_deg);
+    }
+    return null;
+  }
+
   /**
    * 当前航段航线角：首段为本机 → 目标航点；后续段为上一航点 → 当前航点（ENU，与航路段一致）。
    */
@@ -5593,18 +6524,26 @@
     return { fwd: fwd, cross: cross };
   }
 
-  /** ND 机标：实心白三角（空客/现代 ND 风格） */
+  /** ND 机标：与地图本机相同的黄色线型飞机（航向朝上） */
   function drawNdAircraftSymbol(ctx, cx, cy) {
     ctx.save();
-    ctx.fillStyle = "#ffffff";
-    ctx.strokeStyle = "rgba(0,0,0,0.5)";
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#ffd60a";
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 2.8;
     ctx.beginPath();
-    ctx.moveTo(cx, cy - 9);
-    ctx.lineTo(cx + 7, cy + 6.5);
-    ctx.lineTo(cx - 7, cy + 6.5);
-    ctx.closePath();
-    ctx.fill();
+    ctx.moveTo(cx, cy - 11);
+    ctx.lineTo(cx, cy + 8.5);
+    ctx.stroke();
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(cx - 9.5, cy - 1.5);
+    ctx.lineTo(cx + 9.5, cy - 1.5);
+    ctx.stroke();
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx - 4.2, cy + 6.5);
+    ctx.lineTo(cx + 4.2, cy + 6.5);
     ctx.stroke();
     ctx.restore();
   }
@@ -5833,7 +6772,16 @@
           ? tgtTrack
           : lastTelemetry.ground_track_deg;
       if (trkUse != null && Number.isFinite(trkUse)) trkN = normHdg(trkUse);
-      compassRef = hdgN;
+      if (ndArcGndHudEarly && nav) {
+        compassRef = ndCompassRefDeg(lastTelemetry, nav, true);
+        hdgN = ndHeadingMagFromTrue(compassRef, lastTelemetry);
+        const gsNd = lastTelemetry.groundspeed_knots;
+        if (gsNd == null || !Number.isFinite(gsNd) || gsNd < 15) {
+          trkN = hdgN;
+        }
+      } else {
+        compassRef = hdgN;
+      }
       if (planWaypoints.length) advanceWaypoints(acLat, acLon);
     } else if (planWaypoints.length >= 2) {
       ndPreviewMode = true;
@@ -6939,7 +7887,7 @@
     maybeHandlePlanRev(data);
     if (data && data.ok) normalizeTelemetryHeadingMag(data);
     if (!data.ok) {
-      lastTelemetry = data;
+      lastInstrumentTel = null;
       smoothReady = false;
       tapeDispReady = false;
       resetMotion();
@@ -6947,42 +7895,26 @@
       dispPitch = 0;
       dispBank = 0;
       stabilizeTrafficList([], null, null, null);
-      updateTraffic([]);
-      updateCollisionWarnings(null);
-      updateTcassSuppressMapOverlay(null);
-      /* 短时断流仍带航迹：有 trail 则保留绿线，无字段或空数组才清空，避免飞一半整段消失 */
-      if (Array.isArray(data.trail)) {
-        if (data.trail.length >= 2) {
-          updateTrail(data.trail.map(function (p) { return [p[0], p[1]]; }));
-        } else if (data.trail.length === 0) updateTrail([]);
-      }
       updatePfdInstruments(null);
-      resetNdWxSweepAnim();
-      ndWxSweepPos = 1;
-      ndWxSweepDone = true;
-      redrawNd();
-      redrawAdiVnavProfile();
-      syncNdToolbarChrome();
-      setStatus(false, data.error || "未知错误", "请确认已运行 启动.bat 且模拟飞行已进入驾驶舱。");
+      queueMapDisplay(data);
+      const err = data.error || "未知错误";
+      if (/正在连接 SimConnect/.test(err)) {
+        setStatus(
+          true,
+          "<strong>" + err + "</strong>",
+          "请启动 MSFS 并进入驾驶舱；连接成功后会自动更新。"
+        );
+        return;
+      }
+      setStatus(false, err, "请确认已运行 启动.bat 且模拟飞行已进入驾驶舱。");
       return;
     }
     const lat = data.lat;
     const lon = data.lon;
-    const hdg = data.heading_deg;
-    const ll = [lat, wrapLng180(lon)];
 
-    ingestMotionObservation(data, performance.now());
+    ingestAirportGndFromTelemetry(data);
+    ingestInstrumentPacket(data, performance.now());
 
-    if (!marker) {
-      marker = L.marker(L.latLng(ll[0], ll[1]), { icon: planeIcon }).addTo(map);
-      const z0 = Math.max(map.getZoom(), 11);
-      map.setZoom(z0);
-      followPlane = true;
-      scheduleMapLayoutRefresh(true);
-    }
-
-    const trail = (data.trail || []).map(function (p) { return [p[0], p[1]]; });
-    updateTrail(trail);
     data.traffic = stabilizeTrafficList(
       data.traffic || [],
       lat,
@@ -6990,25 +7922,35 @@
       data.traffic_scan
     );
     if (
-      data.airport_gnd &&
-      data.airport_gnd.icao &&
-      ndGndSnapshot &&
-      ndGndSnapshot.icao &&
-      ndGndSnapshot.icao !== data.airport_gnd.icao
+      (data.airport_gnd && data.airport_gnd.icao) ||
+      data.airport_gnd_icao
     ) {
-      ndGndSnapshot = null;
-      ndGndSnapshotAt = 0;
+      var gndIcao = data.airport_gnd
+        ? data.airport_gnd.icao
+        : data.airport_gnd_icao;
+      if (
+        gndIcao &&
+        ndGndSnapshot &&
+        ndGndSnapshot.icao &&
+        ndGndSnapshot.icao !== gndIcao
+      ) {
+        ndGndSnapshot = null;
+        ndGndSnapshotAt = 0;
+        ndGndServerRev = -1;
+      }
     }
-    lastTelemetry = data;
-    updateMapAircraftMarker();
-    updateTcassSuppressMapOverlay(data);
-    redrawNd();
-    redrawAdiVnavProfile();
-    updateCollisionWarnings(data);
-    updateTraffic(data.traffic);
-    syncNdToolbarChrome();
 
-    planHudLine(lat, lon);
+    if (!marker) {
+      const ll = [lat, wrapLng180(lon)];
+      marker = L.marker(L.latLng(ll[0], ll[1]), { icon: planeIcon, zIndexOffset: 1200 }).addTo(map);
+      const z0 = Math.max(map.getZoom(), 11);
+      map.setZoom(z0);
+      followPlane = true;
+      syncFollowPlaneChrome();
+      scheduleMapLayoutRefresh(true);
+    }
+
+    queueMapDisplay(data);
 
     let statusTitle =
       "<strong>已连接</strong> · " + fmtNum(lat, 5) + "°, " + fmtNum(lon, 5) + "°";
@@ -7036,7 +7978,7 @@
       }
     };
     es.onerror = function () {
-      lastTelemetry = { ok: false };
+      lastInstrumentTel = null;
       smoothReady = false;
       tapeDispReady = false;
       resetMotion();
@@ -7045,8 +7987,7 @@
       dispBank = 0;
       /* 不重清航迹：EventSource 重连前常会触发 onerror，误删整条绿线 */
       updatePfdInstruments(null);
-      redrawAdiVnavProfile();
-      redrawNd();
+      queueMapDisplay({ ok: false });
       setStatus(false, "数据流中断", "请保持 msfs_bridge.py 运行；浏览器会自动重连。");
     };
   }
@@ -7101,10 +8042,16 @@
   btnFit.addEventListener("click", fitPlanBounds);
   btnClear.addEventListener("click", function () { clearPlan(); });
   btnFollow.addEventListener("click", function () {
+    if (followPlane) {
+      followPlane = false;
+      syncFollowPlaneChrome();
+      return;
+    }
     followPlane = true;
+    syncFollowPlaneChrome();
     scheduleMapLayoutRefresh(true);
-    refollowMapCenter();
   });
+  syncFollowPlaneChrome();
 
   const ndTrafficToggle = document.getElementById("ndTrafficToggle");
   if (ndTrafficToggle) {
@@ -7159,6 +8106,7 @@
         ndWxSweepPos = 1;
         ndGndLayoutIcao = null;
         ndGndLayoutFitKey = null;
+        ndGndLayoutDataKey = null;
         ndGndWasOnGround = false;
       }
       ndPlanToggle.classList.toggle("is-active", ndPlanMode);
@@ -7223,7 +8171,10 @@
     });
   }
 
-  map.on("dragstart", function () { followPlane = false; });
+  map.on("dragstart", function () {
+    followPlane = false;
+    syncFollowPlaneChrome();
+  });
   map.on("click", function () {
     if (!trafficPinnedId) return;
     trafficPinnedId = null;
@@ -7234,6 +8185,8 @@
   installMapFollowZoomHandlers();
   let mapFollowZoomReflowT = 0;
   map.on("zoom", function () {
+    refreshPlaneMarkerScaleOnly();
+    refreshTrailDisplayForZoom();
     if (!followPlane) return;
     if (mapFollowZoomReflowT) return;
     mapFollowZoomReflowT = requestAnimationFrame(function () {
@@ -7242,6 +8195,8 @@
     });
   });
   map.on("zoomend", function () {
+    refreshPlaneMarkerScaleOnly();
+    refreshTrailDisplayForZoom();
     if (mapFollowZoomReflowT) {
       cancelAnimationFrame(mapFollowZoomReflowT);
       mapFollowZoomReflowT = 0;
@@ -7273,6 +8228,7 @@
   (function initPfdPanelCollapse() {
     const panel = document.getElementById("pfdPanel");
     const btn = document.getElementById("pfdCollapseBtn");
+    const body = document.getElementById("pfdPanelBody");
     const key = "msfs_pfd_panel_collapsed_v1";
     if (!panel || !btn) return;
     function apply(collapsed) {
@@ -7285,6 +8241,12 @@
     } catch (e) {
       /* ignore */
     }
+    if (body) {
+      body.addEventListener("transitionend", function (e) {
+        if (e.propertyName !== "max-height") return;
+        if (followPlane) scheduleMapLayoutRefresh(true);
+      });
+    }
     btn.addEventListener("click", function () {
       const next = !panel.classList.contains("is-collapsed");
       apply(next);
@@ -7293,7 +8255,7 @@
       } catch (e2) {
         /* ignore */
       }
-      scheduleMapLayoutRefresh(followPlane);
+      scheduleMapFollowAfterPfdLayout();
     });
   })();
 
@@ -7320,6 +8282,7 @@
     var lastAppliedScale = null;
     var scaleRaf = 0;
     var scaleTimer = 0;
+    var layoutTimer = 0;
     var initialMeasureDone = false;
 
     function availWidthPx() {
@@ -7345,20 +8308,37 @@
       panel.style.transform = "";
       panel.style.transformOrigin = "";
       panel.style.marginBottom = "";
+      delete panel.dataset.pfdScale;
     }
 
     /** 已缩放时反推自然宽，避免 clearScale 造成闪屏 */
     function measureNaturalOuterW() {
       if (
         initialMeasureDone &&
+        naturalOuterW != null &&
+        panel.classList.contains("is-collapsed")
+      ) {
+        return naturalOuterW;
+      }
+      if (
+        initialMeasureDone &&
         lastAppliedScale != null &&
         lastAppliedScale > 0 &&
         lastAppliedScale < 0.995
       ) {
-        var rw = panel.getBoundingClientRect().width;
-        if (rw > 0) {
-          naturalOuterW = Math.max(DESIGN_MIN, rw / lastAppliedScale);
-          return naturalOuterW;
+        if (!zoomOk && panel.style.transform) {
+          var lw = panel.offsetWidth;
+          if (lw > 0) {
+            naturalOuterW = Math.max(DESIGN_MIN, lw);
+            return naturalOuterW;
+          }
+        }
+        if (zoomOk) {
+          var rw = panel.getBoundingClientRect().width;
+          if (rw > 0) {
+            naturalOuterW = Math.max(DESIGN_MIN, rw / lastAppliedScale);
+            return naturalOuterW;
+          }
         }
       }
       var hide = !panel.classList.contains("is-scale-ready");
@@ -7391,6 +8371,7 @@
     }
 
     function applyZoomScale(sUse) {
+      panel.dataset.pfdScale = String(sUse);
       if (zoomOk) {
         panel.style.transform = "";
         panel.style.transformOrigin = "";
@@ -7473,6 +8454,23 @@
       }, 120);
     }
 
+    /** 折叠/展开只改高度：重算 transform 的 marginBottom，不重测宽度以免缩放累积变小 */
+    function reapplyPfdZoomLayout() {
+      if (lastAppliedScale == null || lastAppliedScale >= 0.995) return;
+      applyZoomScale(lastAppliedScale);
+    }
+
+    function schedulePfdLayoutOnly() {
+      if (layoutTimer) clearTimeout(layoutTimer);
+      layoutTimer = setTimeout(function () {
+        layoutTimer = 0;
+        requestAnimationFrame(function () {
+          reapplyPfdZoomLayout();
+          if (followPlane) scheduleMapFollowAfterPfdLayout();
+        });
+      }, 460);
+    }
+
     window.addEventListener("resize", function () {
       scheduleScale(false, false);
     });
@@ -7483,8 +8481,7 @@
     var btn = document.getElementById("pfdCollapseBtn");
     if (btn) {
       btn.addEventListener("click", function () {
-        invalidateNaturalW();
-        scheduleScale(true, true);
+        schedulePfdLayoutOnly();
       });
     }
 
@@ -7518,15 +8515,18 @@
   })();
 
   syncNdToolbarChrome();
+  connectStream();
   whenPfdScaleReady(function () {
     ndGndLayoutIcao = null;
     ndGndLayoutFitKey = null;
+    ndGndLayoutDataKey = null;
     ndGndWasOnGround = false;
     ndGndUserOverrodeZoom = false;
     ndGndZoomDisp = ND_GND_ZOOM_DISP_DEFAULT;
     scheduleResizeNd();
     scheduleMapLayoutRefresh(false);
-    connectStream();
   });
   requestAnimationFrame(tickSmooth);
+  requestAnimationFrame(tickMapDisplay);
+  requestAnimationFrame(tickMapFollow);
 })();
